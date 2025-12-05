@@ -1,0 +1,39 @@
+# Entorno virtual
+venv/
+env/
+.venv/
+
+# Archivos Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Modelos YOLO (pueden ser grandes)
+*.pt
+*.onnx
+*.weights
+
+# Archivos de configuración del sistema
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Archivos temporales
+*.tmp
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Archivos de audio temporales
+*.wav
+*.mp3
+
