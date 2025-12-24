@@ -71,8 +71,21 @@ class OAKDObjectDetector:
         
         print("Inicializando cámara OAK-D Lite...")
         self.pipeline = self.create_pipeline()
-        self.device = dai.Device(self.pipeline)
-        print("Cámara OAK-D Lite conectada")
+        try:
+            self.device = dai.Device(self.pipeline)
+            print("Cámara OAK-D Lite conectada")
+        except RuntimeError as e:
+            if "ALREADY_IN_USE" in str(e) or "X_LINK" in str(e):
+                print("\n" + "="*60)
+                print("❌ ERROR: La cámara OAK-D Lite está en uso")
+                print("="*60)
+                print("Solución:")
+                print("  1. Detén el programa anterior ejecutando:")
+                print("     pkill -9 -f detector_objetos_oakd.py")
+                print("  2. Espera 3 segundos y vuelve a ejecutar el programa")
+                print("  3. O usa el script: ./detener.sh")
+                print("="*60)
+            raise
         
         # Obtener colas de salida (con timeout para evitar bloqueos)
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
@@ -120,11 +133,13 @@ class OAKDObjectDetector:
                     self.microphone = sr.Microphone(device_index=0)
                     print(f"  ⚠ H390 no encontrado por nombre, usando índice 0 (puede ser el H390)")
                 
-                # Ajustar para ruido ambiente
-                print("Ajustando micrófono para ruido ambiente (2 segundos)...")
+                # Ajustar para ruido ambiente (más tiempo para mejor calibración)
+                print("Ajustando micrófono para ruido ambiente (3 segundos)...")
                 with self.microphone as source:
-                    self.recognizer.adjust_for_ambient_noise(source, duration=2)
-                print("✓ Reconocimiento de voz inicializado")
+                    self.recognizer.adjust_for_ambient_noise(source, duration=3)
+                # Ajustar umbral de energía para ser más sensible a la voz
+                self.recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.5, 100)
+                print(f"✓ Reconocimiento de voz inicializado (umbral: {self.recognizer.energy_threshold:.0f})")
             except Exception as e:
                 print(f"⚠ Advertencia: Error inicializando micrófono: {e}")
                 print("   El reconocimiento de voz puede no funcionar correctamente")
@@ -1019,45 +1034,61 @@ class OAKDObjectDetector:
                 finally:
                     sys.stderr = old_stderr
         
-        print("🎤 Escuchando comandos de voz... (habla cuando veas el indicador)")
+        print("🎤 Escuchando comandos de voz...")
+        print(f"🎤 Umbral de energía: {self.recognizer.energy_threshold:.0f}")
+        print("💡 Habla claramente cuando veas '🎤 Escuchando...'\n")
+        
+        listen_count = 0
         while self.running:
             try:
-                with suppress_stderr():
-                    with self.microphone as source:
-                        # Escuchar con timeout
+                with self.microphone as source:
+                    # Reajustar umbral cada 20 iteraciones
+                    listen_count += 1
+                    if listen_count % 20 == 0:
                         try:
-                            # Mostrar que está escuchando
-                            print("🎤 Escuchando... (habla ahora)", end='\r', flush=True)
+                            with suppress_stderr():
+                                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                            # Hacer más sensible
+                            self.recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.4, 50)
+                        except:
+                            pass
+                    
+                    # Escuchar con timeout más corto para ser más reactivo
+                    try:
+                        print("🎤 Escuchando... (habla ahora)", flush=True)
+                        with suppress_stderr():
                             audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
-                            print("🎤 Procesando audio...                    ", end='\r', flush=True)
-                            # Activar bandera SOLO cuando realmente detecta audio
-                            with self.user_speaking_lock:
-                                self.user_speaking = True
-                        except sr.WaitTimeoutError:
-                            # Si no se detectó audio, no activar bandera
-                            continue
+                        print("🎤 ✓ Audio detectado!", flush=True)
+                        
+                        # Activar bandera
+                        with self.user_speaking_lock:
+                            self.user_speaking = True
                         
                         # Reconocer el audio
                         try:
                             text = self.recognizer.recognize_google(audio, language='es-ES')
                             text = text.lower()
-                            print(f"\n" + "="*60)
-                            print(f"🎤 COMANDO DE VOZ DETECTADO: {text}")
-                            print("="*60)
+                            
+                            # Mostrar en terminal (SIEMPRE)
+                            print("\n" + "="*60)
+                            print(f"🎤 COMANDO DETECTADO: {text}")
+                            print("="*60 + "\n")
+                            
+                            # Agregar a la cola
                             self.voice_commands.put(text)
-                            # Mantener bandera activa hasta que se procese el comando
+                            
                         except sr.UnknownValueError:
-                            # Mostrar que está escuchando pero no entendió
-                            print("🎤 Escuchando... (no se entendió)")
-                            # Desactivar bandera si no se entendió
+                            print("🎤 ⚠ No se entendió, intenta de nuevo\n")
                             with self.user_speaking_lock:
                                 self.user_speaking = False
                         except sr.RequestError as e:
-                            print(f"❌ Error en reconocimiento de voz: {e}")
-                            print("   ¿Tienes conexión a internet? (Google Speech Recognition requiere internet)")
-                            # Desactivar bandera si hay error
+                            print(f"❌ Error de conexión: {e}\n")
                             with self.user_speaking_lock:
                                 self.user_speaking = False
+                            
+                    except sr.WaitTimeoutError:
+                        # No se detectó audio, continuar silenciosamente
+                        continue
             except Exception as e:
                 if self.running:
                     # No imprimir errores de ALSA
@@ -1455,19 +1486,22 @@ class OAKDObjectDetector:
                             'confianza': obj['confianza']
                         }
                 
-                # Mostrar información de objetos detectados
+                # Mostrar información de objetos detectados (cada 10 frames para no saturar)
+                if frame_count % 10 == 0:
+                    if objetos:
+                        print(f"\n--- Frame {frame_count} ---")
+                        for obj in objetos:
+                            print(f"  • {obj['nombre']}: {obj['distancia']:.2f}m (confianza: {obj['confianza']:.2%})")
+                    else:
+                        print(f"\n--- Frame {frame_count} --- Sin objetos detectados")
+                
+                # Hablar resumen cada 10 segundos (con descanso)
                 if objetos:
-                    print(f"\n--- Frame {frame_count} ---")
-                    for obj in objetos:
-                        print(f"  • {obj['nombre']}: {obj['distancia']:.2f}m (confianza: {obj['confianza']:.2%})")
-                    
-                    # Hablar resumen cada 10 segundos (con descanso)
                     if self.should_speak_summary():
                         resumen = self.generar_resumen_voz(objetos)
-                        print(f"\n🔊 RESUMEN (cada 10 segundos): {resumen}")
+                        print(f"\n🔊 RESUMEN: {resumen}")
                         self.speak_text(resumen)
                 else:
-                    # Si no hay objetos, también hablar cada 10 segundos
                     if self.should_speak_summary():
                         resumen = "No estoy viendo ningún objeto en este momento. No hay obstáculos próximos"
                         print(f"\n🔊 RESUMEN: {resumen}")
