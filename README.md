@@ -11,6 +11,7 @@ Este programa detecta objetos en tiempo real usando YOLO (Ultralytics) y calcula
 - ✅ **Síntesis de voz**: El programa habla los objetos detectados por el auricular USB
 - ✅ **Reconocimiento de voz**: Puedes hacer preguntas por voz usando el micrófono del auricular
 - ✅ **Interacción por voz**: Pregunta "¿Estás viendo una silla?" y el programa responderá con la distancia
+- ✅ **GPS**: Lee ubicación GPS desde módulo USB y responde cuando preguntas "¿Dónde estoy?"
 - ✅ Soporte para diferentes modelos YOLO (nano, small, medium, large, xlarge)
 
 ## Requisitos
@@ -38,6 +39,8 @@ sudo apt-get install -y espeak-ng espeak-ng-data
 
 4. Conecta tu auricular USB con micrófono (el programa usará el dispositivo de audio por defecto del sistema).
 
+5. (Opcional) Conecta un módulo GPS por USB para obtener tu ubicación. Si usas GPS, ejecuta `./activar_gps.sh` antes de iniciar el programa.
+
 ## Uso
 
 Ejecuta el programa:
@@ -49,7 +52,8 @@ python detector_objetos_oakd.py
 ### Controles
 
 - **'Q' o 'q' o ESC**: Salir del programa (en la ventana de video)
-- **Ctrl+C**: Salir del programa (en la terminal)
+- **Comando de voz "apagar"**: Di "apagar", "cerrar", "salir", "detener", "parar" o "terminar" para apagar el programa
+- **Tecla 'Q' o ESC**: Salir del programa (en la ventana de video)
 - El programa mostrará en la consola los objetos detectados con sus distancias
 - **El programa hablará automáticamente** los objetos detectados por el auricular USB
 
@@ -58,16 +62,37 @@ python detector_objetos_oakd.py
 Puedes hacer preguntas por voz usando el micrófono del auricular. El programa reconocerá tus preguntas y responderá con la distancia del objeto.
 
 **Ejemplos de preguntas que puedes hacer:**
+
+**Sobre objetos detectados:**
 - "¿Estás viendo una silla?"
 - "¿A qué distancia está la persona?"
 - "¿Ves una mesa?"
 - "¿Hay un auto?"
 - "¿A qué distancia está el perro?"
 
+**Sobre ubicación GPS:**
+- "¿Dónde estoy?"
+- "¿Cuál es mi ubicación?"
+- "¿Qué es mi ubicación?"
+- "Dime dónde estoy"
+- "Coordenadas"
+- "GPS"
+
+**Para apagar el programa:**
+- "Apagar"
+- "Cerrar"
+- "Salir"
+- "Detener"
+- "Parar"
+- "Terminar"
+
 El programa responderá con frases como:
 - "Sí, estoy viendo silla a 2.5 metros"
 - "Sí, estoy viendo persona a 1.2 metros"
 - "No, no estoy viendo [objeto] en este momento"
+- "Estoy en Avenida Principal 123, Barrio Centro, Ciudad. Coordenadas: 34.0522 grados Norte, 118.2437 grados Oeste"
+- "Mi ubicación es: 34.0522 grados Norte, 118.2437 grados Oeste" (si no se puede obtener la dirección)
+- "No tengo señal GPS en este momento. Asegúrate de estar al aire libre"
 
 ## Modelos YOLO Disponibles
 
@@ -128,4 +153,12 @@ El programa muestra:
 - Verifica que el micrófono del auricular esté funcionando
 - Habla claramente y cerca del micrófono
 - El programa ajusta automáticamente el micrófono para el ruido ambiente al iniciar
+
+### El GPS no funciona
+- **Opción 1 (Recomendada)**: Ejecuta `./ejecutar_con_gps.sh` - este script activa el GPS y ejecuta el programa automáticamente
+- **Opción 2**: Ejecuta `activar_gps` (sin sudo) antes de iniciar el programa
+- **Opción 3**: Si es la primera vez, ejecuta `sudo ./configurar_gps_permanente.sh` (solo una vez)
+- Asegúrate de estar al aire libre para recibir señal de satélites
+- Si el GPS no aparece, desconéctalo y vuelve a conectarlo, luego ejecuta `activar_gps` de nuevo
+- El GPS necesita internet para obtener direcciones completas (calle y número), pero las coordenadas funcionan sin internet
 

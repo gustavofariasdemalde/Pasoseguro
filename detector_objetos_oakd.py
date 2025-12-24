@@ -17,6 +17,9 @@ import re
 import os
 import sys
 import signal
+import serial
+import serial.tools.list_ports
+from geopy.geocoders import Nominatim
 
 # Suprimir mensajes de ALSA (audio) desde el inicio usando variables de entorno
 if sys.platform == 'linux':
@@ -135,6 +138,10 @@ class OAKDObjectDetector:
         # Cola para comandos de voz
         self.voice_commands = queue.Queue()
         
+        # Bandera para indicar cuando el usuario está hablando (para pausar síntesis de voz)
+        self.user_speaking = False
+        self.user_speaking_lock = threading.Lock()
+        
         # Objetos detectados actualmente (para responder preguntas)
         self.current_objects = {}
         self.objects_lock = threading.Lock()
@@ -226,6 +233,378 @@ class OAKDObjectDetector:
             self.tts_lock = threading.Lock()
             self.last_spoken = {}
             self.last_spoken_time = {}
+        
+        # Inicializar GPS
+        print("Inicializando GPS...")
+        self.gps_serial = None
+        self.gps_location = None
+        self.gps_lock = threading.Lock()
+        self.gps_thread = None
+        
+        # Inicializar geocodificador para obtener direcciones
+        try:
+            self.geolocator = Nominatim(user_agent="oakd_detector")
+            print("  ✓ Geocodificador inicializado (para obtener direcciones)")
+        except Exception as e:
+            print(f"  ⚠ Error inicializando geocodificador: {e}")
+            self.geolocator = None
+        
+        try:
+            # Intentar activar GPS automáticamente si no se encuentra
+            gps_port = self.find_gps_port()
+            if not gps_port:
+                print("  Intentando activar GPS automáticamente...")
+                try:
+                    import subprocess
+                    # Intentar usar el comando activar_gps (sin sudo después de configuración)
+                    result = subprocess.run(['activar_gps'], 
+                                          capture_output=True, text=True, timeout=8)
+                    if result.returncode == 0:
+                        print("  ✓ GPS activado automáticamente")
+                        time.sleep(3)  # Esperar más tiempo a que aparezca el puerto
+                        gps_port = self.find_gps_port()
+                    else:
+                        # Si falla, intentar con el script local
+                        result = subprocess.run(['./activar_gps_simple.sh'], 
+                                              capture_output=True, text=True, timeout=8)
+                        if result.returncode == 0:
+                            print("  ✓ GPS activado automáticamente")
+                            time.sleep(3)
+                            gps_port = self.find_gps_port()
+                        else:
+                            # Último intento: forzar activación con comandos directos
+                            try:
+                                subprocess.run(['modprobe', '-r', 'ch34x'], 
+                                             capture_output=True, timeout=2)
+                                time.sleep(1)
+                                subprocess.run(['modprobe', 'ch34x'], 
+                                             capture_output=True, timeout=2)
+                                time.sleep(2)
+                                # Intentar escribir en new_id (puede fallar sin sudo)
+                                with open('/sys/bus/usb-serial/drivers/ch34x/new_id', 'w') as f:
+                                    f.write('1a86 7523\n')
+                                time.sleep(2)
+                                gps_port = self.find_gps_port()
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"  ⚠ No se pudo activar GPS automáticamente: {e}")
+                    print("  Ejecuta manualmente: activar_gps")
+                    print("  O si es la primera vez: sudo ./configurar_gps_permanente.sh")
+            
+            if gps_port:
+                # Intentar múltiples baudrates comunes para GPS
+                baudrates = [4800, 9600, 38400, 115200]
+                gps_connected = False
+                for baudrate in baudrates:
+                    try:
+                        self.gps_serial = serial.Serial(gps_port, baudrate=baudrate, timeout=1)
+                        print(f"  ✓ GPS conectado en: {gps_port} (baudrate: {baudrate})")
+                        gps_connected = True
+                        break
+                    except serial.SerialException as e:
+                        if baudrate == baudrates[-1]:  # Último intento
+                            print(f"  ✗ Error conectando GPS en {gps_port}: {e}")
+                            print(f"     Probados baudrates: {baudrates}")
+                        continue
+                
+                if gps_connected:
+                    # Iniciar thread para leer GPS
+                    self.gps_thread = threading.Thread(target=self.read_gps_data, daemon=True)
+                    self.gps_thread.start()
+                    print("  ✓ GPS iniciado, leyendo datos...")
+                    print("  ℹ El GPS necesita estar al aire libre para recibir señal de satélites")
+                else:
+                    self.gps_serial = None
+                    print("  ⚠ No se pudo conectar al GPS, funcionalidad deshabilitada")
+            else:
+                print("  ⚠ GPS no encontrado, funcionalidad deshabilitada")
+                print("  Conecta el módulo GPS por USB y ejecuta: ./activar_gps.sh")
+        except Exception as e:
+            print(f"  ⚠ Error inicializando GPS: {e}")
+            import traceback
+            traceback.print_exc()
+            print("  La funcionalidad GPS estará deshabilitada")
+            self.gps_serial = None
+    
+    def find_gps_port(self):
+        """Busca el puerto serial del GPS"""
+        print("  Buscando puerto GPS...")
+        import glob
+        
+        # Intentar múltiples veces (el puerto puede tardar en aparecer)
+        for intento in range(3):
+            # Primero, buscar directamente en /dev/ttyUSB* (más confiable)
+            usb_ports = glob.glob('/dev/ttyUSB*')
+            if usb_ports:
+                if intento == 0:
+                    print(f"  Encontrados puertos USB: {usb_ports}")
+            for port in sorted(usb_ports):
+                if os.path.exists(port):
+                    try:
+                        # Verificar permisos
+                        if not os.access(port, os.R_OK | os.W_OK):
+                            if intento == 0:
+                                print(f"  ⚠ Puerto {port} existe pero no tiene permisos (ejecuta: sudo chmod 666 {port})")
+                            continue
+                        # Intentar abrir para verificar que es un puerto serial válido
+                        test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
+                        test_serial.close()
+                        print(f"  ✓ Puerto {port} encontrado y accesible")
+                        return port
+                    except serial.SerialException as e:
+                        if intento == 0:
+                            print(f"  ⚠ Puerto {port} no se puede abrir: {e}")
+                        continue
+                    except (OSError, PermissionError) as e:
+                        if intento == 0:
+                            print(f"  ⚠ Error de permisos en {port}: {e}")
+                            print(f"     Ejecuta: sudo chmod 666 {port}")
+                        continue
+            
+            # Si no se encontró, esperar un poco y reintentar
+            if intento < 2:
+                time.sleep(1)
+        
+        # Si no se encuentra en /dev/ttyUSB*, buscar en puertos ACM
+        acm_ports = glob.glob('/dev/ttyACM*')
+        if acm_ports:
+            print(f"  Encontrados puertos ACM: {acm_ports}")
+        for port in sorted(acm_ports):
+            if os.path.exists(port):
+                try:
+                    if not os.access(port, os.R_OK | os.W_OK):
+                        continue
+                    test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
+                    test_serial.close()
+                    print(f"  ✓ Puerto {port} encontrado y accesible")
+                    return port
+                except (serial.SerialException, OSError, PermissionError):
+                    continue
+        
+        # Como último recurso, buscar en la lista de puertos de Python
+        print("  Buscando en lista de puertos del sistema...")
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            # Buscar por descripción o nombre
+            desc = port.description.lower()
+            print(f"  Puerto encontrado: {port.device} - {port.description}")
+            if 'gps' in desc or 'usb' in desc or 'serial' in desc or 'ch340' in desc or 'ch34' in desc:
+                try:
+                    if not os.access(port.device, os.R_OK | os.W_OK):
+                        print(f"  ⚠ Puerto {port.device} no tiene permisos")
+                        continue
+                    test_serial = serial.Serial(port.device, baudrate=4800, timeout=0.5)
+                    test_serial.close()
+                    print(f"  ✓ Puerto {port.device} encontrado y accesible")
+                    return port.device
+                except (serial.SerialException, OSError, PermissionError) as e:
+                    print(f"  ⚠ Puerto {port.device} no se puede abrir: {e}")
+                    continue
+        
+        # Si no se encuentra, probar puertos comunes
+        print("  Probando puertos comunes...")
+        common_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1']
+        for port in common_ports:
+            if os.path.exists(port):
+                try:
+                    if not os.access(port, os.R_OK | os.W_OK):
+                        continue
+                    test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
+                    test_serial.close()
+                    print(f"  ✓ Puerto {port} encontrado y accesible")
+                    return port
+                except:
+                    continue
+        
+        print("  ✗ No se encontró ningún puerto GPS accesible")
+        print("  Sugerencias:")
+        print("    1. Ejecuta: ./activar_gps.sh")
+        print("    2. Verifica que el GPS esté conectado: lsusb | grep CH340")
+        print("    3. Verifica permisos: ls -la /dev/ttyUSB*")
+        return None
+    
+    def parse_nmea(self, nmea_sentence):
+        """Parsea una oración NMEA para extraer coordenadas GPS"""
+        try:
+            if nmea_sentence.startswith('$GPGGA'):
+                parts = nmea_sentence.split(',')
+                if len(parts) >= 10 and parts[2] and parts[4]:  # Tiene latitud y longitud
+                    # Latitud (formato: DDMM.MMMM)
+                    lat_str = parts[2]
+                    if len(lat_str) >= 4:
+                        lat_deg = float(lat_str[:2])
+                        lat_min = float(lat_str[2:])
+                        latitude = lat_deg + lat_min / 60.0
+                        # Corregir: permitir tanto 'N' como 'S'
+                        if parts[3] == 'S':
+                            latitude = -latitude
+                        elif parts[3] != 'N':
+                            return None  # Solo si no es N ni S
+                    else:
+                        return None
+                    
+                    # Longitud (formato: DDDMM.MMMM)
+                    lon_str = parts[4]
+                    if len(lon_str) >= 5:
+                        lon_deg = float(lon_str[:3])
+                        lon_min = float(lon_str[3:])
+                        longitude = lon_deg + lon_min / 60.0
+                        # Corregir: permitir tanto 'E' como 'W'
+                        if parts[5] == 'W':
+                            longitude = -longitude
+                        elif parts[5] != 'E':
+                            return None  # Solo si no es E ni W
+                    else:
+                        return None
+                    
+                    # Calidad de señal
+                    quality = int(parts[6]) if parts[6] else 0
+                    
+                    if quality > 0:  # Solo si hay señal GPS válida
+                        return {
+                            'latitude': latitude,
+                            'longitude': longitude,
+                            'quality': quality,
+                            'timestamp': time.time()
+                        }
+        except Exception as e:
+            pass
+        return None
+    
+    def read_gps_data(self):
+        """Lee datos GPS en un thread separado"""
+        if not self.gps_serial:
+            return
+        
+        buffer = ""
+        nmea_count = 0
+        last_status_print = time.time()
+        last_data_time = time.time()
+        no_data_warning = False
+        
+        print("  📡 GPS: Iniciando lectura de datos...")
+        
+        while self.running and self.gps_serial:
+            try:
+                if self.gps_serial.in_waiting > 0:
+                    data = self.gps_serial.read(self.gps_serial.in_waiting).decode('utf-8', errors='ignore')
+                    buffer += data
+                    last_data_time = time.time()
+                    no_data_warning = False
+                    
+                    # Procesar líneas completas
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line.startswith('$GP'):
+                            nmea_count += 1
+                            # Mostrar primera línea NMEA recibida como confirmación
+                            if nmea_count == 1:
+                                print(f"  ✓ GPS: Recibiendo datos NMEA (primera línea: {line[:50]}...)")
+                            
+                            location = self.parse_nmea(line)
+                            if location:
+                                with self.gps_lock:
+                                    self.gps_location = location
+                                    print(f"📍 GPS: Lat {location['latitude']:.6f}, Lon {location['longitude']:.6f} (calidad: {location['quality']})")
+                            # Mostrar estado cada 30 segundos si no hay señal
+                            elif time.time() - last_status_print > 30:
+                                print("📡 GPS recibiendo datos pero sin señal de satélites (necesita estar al aire libre)")
+                                last_status_print = time.time()
+                else:
+                    # Verificar si no hay datos por mucho tiempo
+                    if time.time() - last_data_time > 10 and not no_data_warning:
+                        print("  ⚠ GPS: No se están recibiendo datos del puerto serial")
+                        print("     Verifica que el GPS esté conectado y funcionando")
+                        no_data_warning = True
+                    time.sleep(0.1)
+            except serial.SerialException as e:
+                if self.running:
+                    print(f"  ✗ Error de comunicación GPS: {e}")
+                    print("     El GPS puede haberse desconectado")
+                time.sleep(2)
+            except Exception as e:
+                if self.running:
+                    print(f"  ✗ Error leyendo GPS: {e}")
+                time.sleep(1)
+    
+    def get_location_text(self):
+        """Obtiene la ubicación actual en formato texto con dirección"""
+        # Verificar si el GPS está conectado
+        if not self.gps_serial:
+            return "El módulo GPS no está conectado. Conecta el GPS por USB y reinicia el programa"
+        
+        with self.gps_lock:
+            if self.gps_location:
+                lat = self.gps_location['latitude']
+                lon = self.gps_location['longitude']
+                quality = self.gps_location['quality']
+                
+                # Intentar obtener dirección (geocodificación inversa)
+                direccion = None
+                if self.geolocator:
+                    try:
+                        location_info = self.geolocator.reverse((lat, lon), timeout=5, language='es')
+                        if location_info:
+                            address = location_info.raw.get('address', {})
+                            
+                            # Construir dirección legible
+                            partes_direccion = []
+                            
+                            # Calle y número
+                            if 'road' in address or 'street' in address:
+                                calle = address.get('road') or address.get('street', '')
+                                numero = address.get('house_number', '')
+                                if numero:
+                                    partes_direccion.append(f"{calle} {numero}")
+                                elif calle:
+                                    partes_direccion.append(calle)
+                            
+                            # Barrio o suburbio
+                            if 'suburb' in address:
+                                partes_direccion.append(address['suburb'])
+                            elif 'neighbourhood' in address:
+                                partes_direccion.append(address['neighbourhood'])
+                            
+                            # Ciudad
+                            if 'city' in address:
+                                partes_direccion.append(address['city'])
+                            elif 'town' in address:
+                                partes_direccion.append(address['town'])
+                            elif 'village' in address:
+                                partes_direccion.append(address['village'])
+                            
+                            # Provincia/Estado
+                            if 'state' in address:
+                                partes_direccion.append(address['state'])
+                            
+                            if partes_direccion:
+                                direccion = ", ".join(partes_direccion)
+                    except Exception as e:
+                        # Si falla la geocodificación, continuar sin dirección
+                        pass
+                
+                # Formatear respuesta
+                if direccion:
+                    # Formatear coordenadas también
+                    lat_dir = "Norte" if lat >= 0 else "Sur"
+                    lon_dir = "Este" if lon >= 0 else "Oeste"
+                    lat_abs = abs(lat)
+                    lon_abs = abs(lon)
+                    
+                    return f"Estoy en {direccion}. Coordenadas: {lat_abs:.4f} grados {lat_dir}, {lon_abs:.4f} grados {lon_dir}"
+                else:
+                    # Si no se pudo obtener dirección, solo coordenadas
+                    lat_dir = "Norte" if lat >= 0 else "Sur"
+                    lon_dir = "Este" if lon >= 0 else "Oeste"
+                    lat_abs = abs(lat)
+                    lon_abs = abs(lon)
+                    
+                    return f"Mi ubicación es: {lat_abs:.4f} grados {lat_dir}, {lon_abs:.4f} grados {lon_dir}"
+            else:
+                # GPS conectado pero sin señal
+                return "El GPS está conectado pero no tiene señal de satélites. Necesito estar al aire libre para recibir señal GPS. El WiFi no es suficiente, necesito ver los satélites"
     
     def _signal_handler(self, signum, frame):
         """Maneja señales para detener el programa correctamente"""
@@ -651,7 +1030,11 @@ class OAKDObjectDetector:
                             print("🎤 Escuchando... (habla ahora)", end='\r', flush=True)
                             audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
                             print("🎤 Procesando audio...                    ", end='\r', flush=True)
+                            # Activar bandera SOLO cuando realmente detecta audio
+                            with self.user_speaking_lock:
+                                self.user_speaking = True
                         except sr.WaitTimeoutError:
+                            # Si no se detectó audio, no activar bandera
                             continue
                         
                         # Reconocer el audio
@@ -662,12 +1045,19 @@ class OAKDObjectDetector:
                             print(f"🎤 COMANDO DE VOZ DETECTADO: {text}")
                             print("="*60)
                             self.voice_commands.put(text)
+                            # Mantener bandera activa hasta que se procese el comando
                         except sr.UnknownValueError:
                             # Mostrar que está escuchando pero no entendió
                             print("🎤 Escuchando... (no se entendió)")
+                            # Desactivar bandera si no se entendió
+                            with self.user_speaking_lock:
+                                self.user_speaking = False
                         except sr.RequestError as e:
                             print(f"❌ Error en reconocimiento de voz: {e}")
                             print("   ¿Tienes conexión a internet? (Google Speech Recognition requiere internet)")
+                            # Desactivar bandera si hay error
+                            with self.user_speaking_lock:
+                                self.user_speaking = False
             except Exception as e:
                 if self.running:
                     # No imprimir errores de ALSA
@@ -677,6 +1067,69 @@ class OAKDObjectDetector:
     
     def process_voice_command(self, command):
         """Procesa un comando de voz y responde"""
+        # El usuario está hablando, mantener bandera activa durante el procesamiento
+        command_lower = command.lower()
+        
+        # Comando para apagar el programa
+        apagar_patterns = [
+            r'apagar',
+            r'apaga',
+            r'cerrar',
+            r'cierra',
+            r'salir',
+            r'sale',
+            r'detener',
+            r'detén',
+            r'parar',
+            r'para',
+            r'terminar',
+            r'termina'
+        ]
+        
+        # Verificar si es comando de apagado
+        for pattern in apagar_patterns:
+            if re.search(pattern, command_lower):
+                print(f"🎤 Comando de apagado detectado: {command}")
+                respuesta = "Apagando el sistema. Hasta luego."
+                print(f"📢 Respuesta: {respuesta}")
+                self.speak_text(respuesta, force=True)
+                # Desactivar bandera
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                # Detener el programa
+                self.running = False
+                return True
+        
+        # Comandos GPS
+        gps_patterns = [
+            r'dónde estoy',
+            r'donde estoy',
+            r'cuál es mi ubicación',
+            r'cual es mi ubicacion',
+            r'qué es mi ubicación',
+            r'que es mi ubicacion',
+            r'dime dónde estoy',
+            r'dime donde estoy',
+            r'ubicación',
+            r'ubicacion',
+            r'coordenadas',
+            r'posición',
+            r'posicion',
+            r'gps'
+        ]
+        
+        # Verificar si es una pregunta GPS
+        for pattern in gps_patterns:
+            if re.search(pattern, command_lower):
+                location_text = self.get_location_text()
+                print(f"🎤 Pregunta GPS: {command}")
+                print(f"📍 Respuesta: {location_text}")
+                self.speak_text(location_text, force=True)  # Forzar para responder al usuario
+                # Desactivar bandera después de responder
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                return True
+        
         # Traducciones de objetos al inglés (para buscar en YOLO)
         traducciones_inv = {
             'silla': 'chair',
@@ -778,7 +1231,10 @@ class OAKDObjectDetector:
                         respuesta = f"Sí, estoy viendo {nombre_es} a {distancia:.1f} metros"
                     
                     print(f"📢 Respuesta: {respuesta}")
-                    self.speak_text(respuesta)
+                    self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
+                    # Desactivar bandera después de responder
+                    with self.user_speaking_lock:
+                        self.user_speaking = False
                     return True
                 else:
                     # Buscar variaciones del nombre
@@ -814,21 +1270,43 @@ class OAKDObjectDetector:
                                 respuesta = f"Sí, estoy viendo {nombre_es} a {distancia:.1f} metros"
                             
                             print(f"📢 Respuesta: {respuesta}")
-                            self.speak_text(respuesta)
+                            self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
+                            # Desactivar bandera después de responder
+                            with self.user_speaking_lock:
+                                self.user_speaking = False
                             return True
                     
                     # No se encontró el objeto
                     respuesta = f"No, no estoy viendo {objeto_encontrado} en este momento"
                     print(f"📢 Respuesta: {respuesta}")
-                    self.speak_text(respuesta)
+                    self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
+                    # Desactivar bandera después de responder
+                    with self.user_speaking_lock:
+                        self.user_speaking = False
                     return True
         
+        # Desactivar bandera si no se procesó ningún comando
+        with self.user_speaking_lock:
+            self.user_speaking = False
         return False
     
-    def speak_text(self, text):
-        """Habla un texto usando síntesis de voz"""
+    def speak_text(self, text, force=False):
+        """
+        Habla un texto usando síntesis de voz
+        
+        Args:
+            text: Texto a hablar
+            force: Si es True, habla incluso si el usuario está hablando (para respuestas a preguntas)
+        """
         def _speak():
             try:
+                # Si no es forzado, verificar si el usuario está hablando
+                if not force:
+                    with self.user_speaking_lock:
+                        if self.user_speaking:
+                            print("🔇 Pausando síntesis de voz (usuario hablando)")
+                            return  # No hablar si el usuario está hablando (solo para resúmenes automáticos)
+                
                 # Asegurar que el auricular esté configurado antes de hablar
                 try:
                     import subprocess
@@ -844,6 +1322,13 @@ class OAKDObjectDetector:
                             break
                 except:
                     pass
+                
+                # Si no es forzado, verificar nuevamente antes de hablar
+                if not force:
+                    with self.user_speaking_lock:
+                        if self.user_speaking:
+                            print("🔇 Pausando síntesis de voz (usuario hablando)")
+                            return
                 
                 with self.tts_lock:
                     self.tts_engine.say(text)
@@ -866,6 +1351,7 @@ class OAKDObjectDetector:
         print("   - Descansa 10 segundos entre cada mensaje")
         print("🎤 Micrófono: Puedes hacer preguntas por voz")
         print("   Ejemplos: '¿Estás viendo una silla?' o '¿A qué distancia está la persona?'")
+        print("   GPS: '¿Dónde estoy?' o '¿Cuál es mi ubicación?'")
         print("⌨️  CONTROLES:")
         print("   • Presiona 'Q', 'q' o ESC en la ventana de video para SALIR")
         print("   • O presiona Ctrl+C en esta terminal para SALIR")
@@ -1013,7 +1499,7 @@ class OAKDObjectDetector:
                 # Texto de instrucciones
                 cv2.putText(frame, "Presiona 'Q' o ESC para SALIR", (20, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, "O Ctrl+C en terminal", (20, 60),
+                cv2.putText(frame, "O di 'APAGAR' por voz", (20, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
                 
                 # Verificar running antes de mostrar
@@ -1027,7 +1513,7 @@ class OAKDObjectDetector:
                     
         except KeyboardInterrupt:
             print("\n" + "="*60)
-            print("SALIENDO... (Presionaste Ctrl+C)")
+            print("SALIENDO... (Interrupción detectada)")
             print("="*60)
             self.running = False
         except Exception as e:
