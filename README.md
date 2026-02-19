@@ -6,6 +6,7 @@ Este programa detecta objetos en tiempo real usando YOLO (Ultralytics) y calcula
 
 - ✅ Detección de objetos en tiempo real con YOLO v8
 - ✅ Cálculo de distancias usando la información de profundidad de OAK-D Lite
+- ✅ **Detección de desniveles**: Detecta escalones, bordillos e inclinaciones en el suelo
 - ✅ Visualización de objetos detectados con bounding boxes
 - ✅ Información de distancia y confianza para cada objeto
 - ✅ **Síntesis de voz**: El programa habla los objetos detectados por el auricular USB
@@ -159,6 +160,8 @@ El programa muestra:
 - **Opción 2**: Ejecuta `activar_gps` (sin sudo) antes de iniciar el programa
 - **Opción 3**: Si es la primera vez, ejecuta `sudo ./configurar_gps_permanente.sh` (solo una vez)
 - Asegúrate de estar al aire libre para recibir señal de satélites
-- Si el GPS no aparece, desconéctalo y vuelve a conectarlo, luego ejecuta `activar_gps` de nuevo
+
+
+       ´´  - Si el GPS no aparece, desconéctalo y vuelve a conectarlo, luego ejecuta `activar_gps` de nuevo
 - El GPS necesita internet para obtener direcciones completas (calle y número), pero las coordenadas funcionan sin internet
 

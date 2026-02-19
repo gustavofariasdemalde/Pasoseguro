@@ -94,6 +94,10 @@ class OAKDObjectDetector:
         # Flag para controlar el loop
         self.running = True
         
+        # Variables para detección de desniveles
+        self.ultimo_desnivel_anunciado = None
+        self.frame_desnivel_anterior = 0
+        
         # Configurar manejo de señales para detener correctamente
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -675,13 +679,14 @@ class OAKDObjectDetector:
     def get_distance_at_point(self, depth_frame, x, y):
         """
         Obtiene la distancia en metros en un punto específico del frame de profundidad
+        Usa una pequeña región alrededor del punto para mayor robustez
         
         Args:
             depth_frame: Frame de profundidad
             x, y: Coordenadas del punto
             
         Returns:
-            Distancia en metros
+            Distancia en metros, o None si no es válida
         """
         if depth_frame is None:
             return None
@@ -690,11 +695,189 @@ class OAKDObjectDetector:
         x = int(np.clip(x, 0, depth_frame.shape[1] - 1))
         y = int(np.clip(y, 0, depth_frame.shape[0] - 1))
         
-        # Obtener la distancia en milímetros y convertir a metros
-        distance_mm = depth_frame[y, x]
+        # Usar una pequeña región alrededor del punto para mayor robustez
+        # (reduce errores de medición puntual)
+        region_size = 3
+        x1 = max(0, x - region_size)
+        x2 = min(depth_frame.shape[1], x + region_size + 1)
+        y1 = max(0, y - region_size)
+        y2 = min(depth_frame.shape[0], y + region_size + 1)
+        
+        # Obtener profundidades válidas en la región
+        region = depth_frame[y1:y2, x1:x2]
+        valid_depths = region[(region > 0) & (region < 10000)]  # Filtrar 0 y valores > 10m
+        
+        if len(valid_depths) == 0:
+            return None
+        
+        # Usar mediana para mayor robustez (menos afectada por valores atípicos)
+        distance_mm = np.median(valid_depths)
         distance_m = distance_mm / 1000.0
         
+        # Validar que la distancia sea razonable (entre 0.1m y 10m)
+        # Si es 0 o muy pequeña, probablemente es un error de medición
+        if distance_m < 0.1 or distance_m > 10.0:
+            return None
+        
         return distance_m
+    
+    def detect_desniveles_suelo(self, depth_frame, umbral_cambio=0.10, umbral_inclinacion=0.08, max_desnivel=0.50):
+        """
+        Detecta desniveles en el suelo analizando la parte inferior del frame de profundidad
+        Optimizado para uso en exteriores (bordillos, escalones, rampas)
+        SOLO detecta desniveles menores a 50cm para evitar confundir con objetos grandes
+        
+        Args:
+            depth_frame: Frame de profundidad completo
+            umbral_cambio: Cambio mínimo en metros para considerar un desnivel (default: 10cm - bordillos típicos)
+            umbral_inclinacion: Diferencia mínima para detectar inclinación (default: 8cm)
+            max_desnivel: Máximo desnivel a detectar en metros (default: 50cm) - ignora objetos grandes
+            
+        Returns:
+            dict con información sobre desniveles detectados:
+            {
+                'hay_desnivel': bool,
+                'tipo': 'escalon_arriba' | 'escalon_abajo' | 'inclinacion' | None,
+                'altura_cambio': float (metros),
+                'distancia': float (metros),
+                'mensaje': str
+            }
+        """
+        if depth_frame is None or depth_frame.size == 0:
+            return {
+                'hay_desnivel': False,
+                'tipo': None,
+                'altura_cambio': 0.0,
+                'distancia': 0.0,
+                'mensaje': None
+            }
+        
+        height, width = depth_frame.shape
+        # Analizar SOLO la parte más baja del frame (últimos 20% donde está el suelo real)
+        # Esto evita confundir objetos grandes (heladeras, muebles) con desniveles
+        suelo_inicio = int(height * 0.80)  # Solo últimos 20% del frame
+        suelo_fin = height
+        
+        # Obtener profundidad del suelo en diferentes puntos horizontales
+        # Dividir en 7 regiones para mejor resolución (más puntos = mejor detección)
+        puntos_muestra = 7
+        profundidades = []
+        
+        for i in range(puntos_muestra):
+            x = int(width * (i + 0.5) / puntos_muestra)
+            # Tomar promedio de profundidad en una región más grande para exteriores
+            # (reduce ruido y mejora estabilidad)
+            y_medio = (suelo_inicio + suelo_fin) // 2
+            region_size = 15  # Aumentado de 10 a 15 para mejor estabilidad en exteriores
+            
+            x1 = max(0, x - region_size)
+            x2 = min(width, x + region_size)
+            y1 = max(suelo_inicio, y_medio - region_size)
+            y2 = min(suelo_fin, y_medio + region_size)
+            
+            # Obtener profundidades válidas (no cero) en la región
+            region = depth_frame[y1:y2, x1:x2]
+            # Filtrar valores inválidos (0) y valores extremos (ruido)
+            valid_depths = region[(region > 0) & (region < 10000)]  # < 10 metros
+            
+            if len(valid_depths) > 5:  # Necesitamos al menos 5 puntos válidos
+                # Convertir de mm a metros y obtener mediana (más robusta que promedio)
+                profundidad_mm = np.median(valid_depths)
+                profundidad_m = profundidad_mm / 1000.0
+                # Rango válido para exteriores: 0.5m a 8m (mejor para uso en calle)
+                if 0.5 <= profundidad_m <= 8.0:
+                    profundidades.append(profundidad_m)
+                else:
+                    profundidades.append(None)
+            else:
+                profundidades.append(None)
+        
+        # Filtrar valores None
+        profundidades_validas = [p for p in profundidades if p is not None]
+        
+        if len(profundidades_validas) < 4:
+            # Necesitamos al menos 4 puntos válidos para detectar desniveles confiablemente
+            return {
+                'hay_desnivel': False,
+                'tipo': None,
+                'altura_cambio': 0.0,
+                'distancia': np.mean(profundidades_validas) if profundidades_validas else 0.0,
+                'mensaje': None
+            }
+        
+        # Calcular estadísticas
+        profundidad_promedio = np.mean(profundidades_validas)
+        profundidad_min = np.min(profundidades_validas)
+        profundidad_max = np.max(profundidades_validas)
+        diferencia_max = profundidad_max - profundidad_min
+        
+        # Detectar escalón (cambio brusco)
+        # Comparar regiones adyacentes
+        cambios_bruscos = []
+        for i in range(len(profundidades) - 1):
+            if profundidades[i] is not None and profundidades[i+1] is not None:
+                cambio = abs(profundidades[i] - profundidades[i+1])
+                if cambio > umbral_cambio:
+                    cambios_bruscos.append({
+                        'cambio': cambio,
+                        'posicion': i,
+                        'direccion': 'arriba' if profundidades[i+1] < profundidades[i] else 'abajo'
+                    })
+        
+        # Detectar inclinación (cambio gradual pero significativo)
+        inclinacion_detectada = diferencia_max > umbral_inclinacion and len(cambios_bruscos) == 0
+        
+        resultado = {
+            'hay_desnivel': False,
+            'tipo': None,
+            'altura_cambio': 0.0,
+            'distancia': profundidad_promedio,
+            'mensaje': None
+        }
+        
+        if cambios_bruscos:
+            # Hay un escalón - FILTRAR: solo si es menor a max_desnivel (50cm)
+            cambio_max = max(cambios_bruscos, key=lambda x: x['cambio'])
+            
+            # IMPORTANTE: Solo reportar si el cambio es menor a 50cm
+            # Cambios mayores son objetos grandes (heladeras, muebles), no desniveles del suelo
+            if cambio_max['cambio'] <= max_desnivel:
+                resultado['hay_desnivel'] = True
+                resultado['altura_cambio'] = cambio_max['cambio']
+                resultado['tipo'] = 'escalon_arriba' if cambio_max['direccion'] == 'arriba' else 'escalon_abajo'
+                
+                if cambio_max['direccion'] == 'arriba':
+                    resultado['mensaje'] = f"Escalón hacia arriba de {cambio_max['cambio']*100:.0f} centímetros"
+                else:
+                    resultado['mensaje'] = f"Escalón hacia abajo de {cambio_max['cambio']*100:.0f} centímetros"
+            else:
+                # Cambio muy grande = objeto grande, no desnivel
+                resultado['hay_desnivel'] = False
+                resultado['mensaje'] = None
+        
+        elif inclinacion_detectada:
+            # Hay inclinación del terreno - FILTRAR: solo si es menor a max_desnivel (50cm)
+            if diferencia_max <= max_desnivel:
+                resultado['hay_desnivel'] = True
+                resultado['tipo'] = 'inclinacion'
+                resultado['altura_cambio'] = diferencia_max
+                
+                # Determinar dirección de la inclinación
+                if profundidades[0] is not None and profundidades[-1] is not None:
+                    if profundidades[0] < profundidades[-1]:
+                        direccion = "hacia la derecha"
+                    else:
+                        direccion = "hacia la izquierda"
+                else:
+                    direccion = "del terreno"
+                
+                resultado['mensaje'] = f"Inclinación {direccion} de {diferencia_max*100:.0f} centímetros"
+            else:
+                # Inclinación muy grande = objeto grande, no desnivel
+                resultado['hay_desnivel'] = False
+                resultado['mensaje'] = None
+        
+        return resultado
     
     def draw_detections(self, frame, results, depth_frame):
         """
@@ -724,10 +907,17 @@ class OAKDObjectDetector:
                 center_y = int((y1 + y2) / 2)
                 
                 # Obtener distancia en el centro del objeto
+                # Si falla, intentar en la parte inferior del objeto (más cerca del suelo)
                 distance = self.get_distance_at_point(depth_frame, center_x, center_y)
                 
-                # Almacenar información del objeto
-                if distance is not None:
+                # Si la distancia es inválida o 0, intentar en la parte inferior del bounding box
+                if distance is None or distance < 0.1:
+                    # Probar en la parte inferior del objeto (más cerca del suelo)
+                    bottom_y = min(y2 - 5, depth_frame.shape[0] - 1)  # 5 píxeles desde el borde inferior
+                    distance = self.get_distance_at_point(depth_frame, center_x, bottom_y)
+                
+                # Almacenar información del objeto solo si la distancia es válida
+                if distance is not None and distance >= 0.1:
                     objetos_detectados.append({
                         'nombre': class_name,
                         'distancia': distance,
@@ -1035,40 +1225,78 @@ class OAKDObjectDetector:
                     sys.stderr = old_stderr
         
         print("🎤 Escuchando comandos de voz...")
-        print(f"🎤 Umbral de energía: {self.recognizer.energy_threshold:.0f}")
+        # Configurar umbral inicial más bajo para mayor sensibilidad
+        self.recognizer.energy_threshold = 300  # Más sensible
+        print(f"🎤 Umbral de energía inicial: {self.recognizer.energy_threshold:.0f}")
         print("💡 Habla claramente cuando veas '🎤 Escuchando...'\n")
         
         listen_count = 0
+        consecutive_failures = 0
+        
         while self.running:
             try:
                 with self.microphone as source:
-                    # Reajustar umbral cada 20 iteraciones
+                    # Reajustar umbral cada 10 iteraciones (más frecuente)
                     listen_count += 1
-                    if listen_count % 20 == 0:
+                    if listen_count % 10 == 0:
                         try:
                             with suppress_stderr():
-                                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                            # Hacer más sensible
-                            self.recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.4, 50)
-                        except:
-                            pass
+                                # Ajustar ruido ambiental con más tiempo
+                                self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                            # Forzar umbral más bajo para mayor sensibilidad
+                            current_threshold = self.recognizer.energy_threshold
+                            # Reducir a máximo 300 (muy sensible)
+                            self.recognizer.energy_threshold = min(current_threshold * 0.6, 300)
+                            if listen_count % 50 == 0:  # Cada 50 iteraciones, mostrar umbral
+                                print(f"🎤 Umbral ajustado: {self.recognizer.energy_threshold:.0f}")
+                        except Exception as e:
+                            # Si falla el ajuste, forzar umbral bajo
+                            self.recognizer.energy_threshold = 300
                     
-                    # Escuchar con timeout más corto para ser más reactivo
+                    # Escuchar con timeout más largo y phrase_time_limit más largo
                     try:
                         print("🎤 Escuchando... (habla ahora)", flush=True)
                         with suppress_stderr():
-                            audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
+                            # Timeout más largo (3 segundos) y phrase_time_limit más largo (8 segundos)
+                            audio = self.recognizer.listen(source, timeout=3, phrase_time_limit=8)
                         print("🎤 ✓ Audio detectado!", flush=True)
                         
                         # Activar bandera
                         with self.user_speaking_lock:
                             self.user_speaking = True
                         
-                        # Reconocer el audio
-                        try:
-                            text = self.recognizer.recognize_google(audio, language='es-ES')
-                            text = text.lower()
-                            
+                        # Reconocer el audio con reintentos
+                        text = None
+                        max_retries = 3
+                        for retry in range(max_retries):
+                            try:
+                                text = self.recognizer.recognize_google(audio, language='es-ES')
+                                text = text.lower()
+                                consecutive_failures = 0  # Resetear contador de fallos
+                                break
+                            except sr.UnknownValueError:
+                                if retry < max_retries - 1:
+                                    print(f"🎤 ⚠ Intento {retry + 1}/{max_retries}: No se entendió, reintentando...", flush=True)
+                                    time.sleep(0.2)
+                                else:
+                                    print("🎤 ⚠ No se entendió después de varios intentos, intenta de nuevo\n", flush=True)
+                                    with self.user_speaking_lock:
+                                        self.user_speaking = False
+                                    consecutive_failures += 1
+                                    # Si hay muchos fallos, reducir umbral
+                                    if consecutive_failures >= 5:
+                                        self.recognizer.energy_threshold = max(50, self.recognizer.energy_threshold * 0.5)
+                                        print(f"🎤 ⚠ Reduciendo umbral a {self.recognizer.energy_threshold:.0f} por fallos consecutivos")
+                                        consecutive_failures = 0
+                            except sr.RequestError as e:
+                                print(f"❌ Error de conexión: {e}\n", flush=True)
+                                with self.user_speaking_lock:
+                                    self.user_speaking = False
+                                time.sleep(1)  # Esperar antes de reintentar
+                                break
+                        
+                        # Si se reconoció texto, procesarlo
+                        if text:
                             # Mostrar en terminal (SIEMPRE)
                             print("\n" + "="*60)
                             print(f"🎤 COMANDO DETECTADO: {text}")
@@ -1077,17 +1305,11 @@ class OAKDObjectDetector:
                             # Agregar a la cola
                             self.voice_commands.put(text)
                             
-                        except sr.UnknownValueError:
-                            print("🎤 ⚠ No se entendió, intenta de nuevo\n")
-                            with self.user_speaking_lock:
-                                self.user_speaking = False
-                        except sr.RequestError as e:
-                            print(f"❌ Error de conexión: {e}\n")
-                            with self.user_speaking_lock:
-                                self.user_speaking = False
-                            
                     except sr.WaitTimeoutError:
                         # No se detectó audio, continuar silenciosamente
+                        # Reducir umbral si hay muchos timeouts
+                        if listen_count % 30 == 0:
+                            self.recognizer.energy_threshold = max(50, self.recognizer.energy_threshold * 0.8)
                         continue
             except Exception as e:
                 if self.running:
@@ -1101,32 +1323,85 @@ class OAKDObjectDetector:
         # El usuario está hablando, mantener bandera activa durante el procesamiento
         command_lower = command.lower()
         
-        # Comando para apagar el programa
+        # Comando para apagar el programa - PATRONES MÁS FLEXIBLES
         apagar_patterns = [
             r'apagar',
             r'apaga',
+            r'apagalo',
+            r'apagalo',
+            r'apagá',
+            r'apagálo',
             r'cerrar',
             r'cierra',
+            r'cerralo',
+            r'cerrá',
+            r'cerrálo',
             r'salir',
             r'sale',
+            r'salilo',
             r'detener',
             r'detén',
+            r'detenlo',
+            r'detenélo',
             r'parar',
             r'para',
+            r'paralo',
+            r'pará',
+            r'parálo',
             r'terminar',
-            r'termina'
+            r'termina',
+            r'terminarlo',
+            r'terminá',
+            r'terminálo',
+            r'apaga sistema',
+            r'apagar sistema',
+            r'cierra sistema',
+            r'cerrar sistema'
         ]
         
-        # Verificar si es comando de apagado
+        # Verificar si es comando de apagado - BÚSQUEDA MÁS FLEXIBLE
+        command_words = command_lower.split()
         for pattern in apagar_patterns:
-            if re.search(pattern, command_lower):
-                print(f"🎤 Comando de apagado detectado: {command}")
+            # Buscar patrón completo o como palabra individual
+            if re.search(pattern, command_lower) or any(re.search(pattern, word) for word in command_words):
+                print(f"🎤 ✓✓✓ COMANDO DE APAGADO DETECTADO: '{command}' (patrón: {pattern})")
                 respuesta = "Apagando el sistema. Hasta luego."
                 print(f"📢 Respuesta: {respuesta}")
-                self.speak_text(respuesta, force=True)
+                
+                # Para el comando de apagado, hablar directamente (sin thread) para asegurar que termine
+                if self.tts_engine is not None:
+                    try:
+                        # Asegurar que el auricular esté configurado
+                        try:
+                            import subprocess
+                            result = subprocess.run(['pactl', 'list', 'short', 'sinks'], 
+                                                  capture_output=True, text=True, timeout=0.5)
+                            for line in result.stdout.split('\n'):
+                                if 'logi' in line.lower() or 'h390' in line.lower():
+                                    h390_sink = line.split()[1]
+                                    subprocess.run(['pactl', 'set-default-sink', h390_sink], 
+                                                 capture_output=True, timeout=0.5)
+                                    subprocess.run(['pactl', 'set-sink-volume', h390_sink, '100%'], 
+                                                 capture_output=True, timeout=0.5)
+                                    break
+                        except:
+                            pass
+                        
+                        # Hablar directamente y ESPERAR a que termine
+                        with self.tts_lock:
+                            self.tts_engine.say(respuesta)
+                            self.tts_engine.runAndWait()  # Esperar a que termine de hablar
+                        print("📢 Mensaje de despedida completado")
+                    except Exception as e:
+                        print(f"⚠ Error al hablar despedida: {e}")
+                
                 # Desactivar bandera
                 with self.user_speaking_lock:
                     self.user_speaking = False
+                
+                # Esperar un momento para asegurar que el audio termine
+                time.sleep(0.5)
+                
                 # Detener el programa
                 self.running = False
                 return True
@@ -1379,6 +1654,7 @@ class OAKDObjectDetector:
         print("🔊 Audio: El programa hablará un resumen cada 10 segundos")
         print("   - Dice qué objetos ve y sus distancias")
         print("   - Indica si hay obstáculos próximos (menos de 2 metros)")
+        print("   - Detecta y anuncia desniveles en el suelo (escalones, bordillos, inclinaciones)")
         print("   - Descansa 10 segundos entre cada mensaje")
         print("🎤 Micrófono: Puedes hacer preguntas por voz")
         print("   Ejemplos: '¿Estás viendo una silla?' o '¿A qué distancia está la persona?'")
@@ -1477,6 +1753,28 @@ class OAKDObjectDetector:
                 # Dibujar detecciones
                 objetos = self.draw_detections(frame, results, depth_frame)
                 
+                # Detectar desniveles en el suelo (cada 5 frames para no saturar)
+                desnivel_info = None
+                if frame_count % 5 == 0:
+                    desnivel_info = self.detect_desniveles_suelo(depth_frame)
+                    
+                    # Anunciar desnivel si es significativo y no se anunció recientemente
+                    if desnivel_info['hay_desnivel']:
+                        # Solo anunciar si es diferente al anterior o han pasado 30 frames (aprox 1 segundo)
+                        mensaje_actual = desnivel_info['mensaje']
+                        if (mensaje_actual != self.ultimo_desnivel_anunciado or 
+                            (frame_count - self.frame_desnivel_anterior) > 30):
+                            print(f"\n⚠️  DESNIVEL DETECTADO: {mensaje_actual}")
+                            self.speak_text(f"Atención: {mensaje_actual}", force=True)
+                            self.ultimo_desnivel_anunciado = mensaje_actual
+                            self.frame_desnivel_anterior = frame_count
+                            
+                            # Dibujar advertencia visual en el frame
+                            cv2.putText(frame, "DESNIVEL!", (10, 50), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                            cv2.putText(frame, desnivel_info['mensaje'], (10, 90), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
                 # Actualizar objetos actuales para responder preguntas
                 with self.objects_lock:
                     self.current_objects = {}
@@ -1492,8 +1790,12 @@ class OAKDObjectDetector:
                         print(f"\n--- Frame {frame_count} ---")
                         for obj in objetos:
                             print(f"  • {obj['nombre']}: {obj['distancia']:.2f}m (confianza: {obj['confianza']:.2%})")
+                        if desnivel_info and desnivel_info['hay_desnivel']:
+                            print(f"  ⚠️  Desnivel: {desnivel_info['mensaje']}")
                     else:
                         print(f"\n--- Frame {frame_count} --- Sin objetos detectados")
+                        if desnivel_info and desnivel_info['hay_desnivel']:
+                            print(f"  ⚠️  Desnivel: {desnivel_info['mensaje']}")
                 
                 # Hablar resumen cada 10 segundos (con descanso)
                 if objetos:

@@ -1,0 +1,38 @@
+============================================================
+INFORMACIÓN PARA CONEXIÓN SSH REMOTA
+============================================================
+
+Hostname: gustavo-desktop
+Usuario: gustavo
+IP Principal: 192.168.0.150
+
+INSTRUCCIONES PARA CONECTARSE DESDE TU LAPTOP:
+
+1. Desde Linux/Mac en terminal:
+   ssh gustavo@192.168.0.150
+
+2. Desde Windows (PowerShell o CMD):
+   ssh gustavo@192.168.0.150
+
+3. Si es la primera vez, te pedirá confirmar la clave del servidor (escribe "yes")
+
+4. Te pedirá la contraseña: gustavo
+
+5. Una vez conectado, estarás en la terminal remota del Jetson
+
+PARA VERIFICAR QUE ESTÁS CONECTADO:
+   - Ejecuta: hostname
+   - Deberías ver: gustavo-desktop
+   - Ejecuta: pwd
+   - Deberías ver: /home/gustavo (o el directorio donde estés)
+
+PARA SALIR DE LA SESIÓN SSH:
+   - Escribe: exit
+   - O presiona: Ctrl+D
+
+NOTAS:
+- Asegúrate de que tu laptop esté en la misma red WiFi/Ethernet que el Jetson
+- Si la IP cambia, puedes encontrarla ejecutando en el Jetson:
+  hostname -I | awk '{print $1}'
+
+============================================================
