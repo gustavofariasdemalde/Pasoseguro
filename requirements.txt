@@ -7,4 +7,5 @@ SpeechRecognition>=3.10.0
 pyaudio>=0.2.11
 pyserial>=3.5
 geopy>=2.3.0
+easyocr>=1.7.0
 

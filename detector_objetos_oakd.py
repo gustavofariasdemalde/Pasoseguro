@@ -4,12 +4,16 @@ Programa de detección de objetos con YOLO y cámara OAK-D Lite
 Detecta objetos y calcula distancias usando la información de profundidad
 """
 
+import os
+import sys
+
+# Si no hay DISPLAY, ejecutar con: ./ejecutar.sh (él arranca Xvfb y pone DISPLAY=:99)
 import cv2
 import numpy as np
 import depthai as dai
 from ultralytics import YOLO
 import time
-import pyttsx3
+# pyttsx3 deshabilitado: su carga provoca Abortado (SIGABRT) en Jetson
 import threading
 import speech_recognition as sr
 import queue
@@ -105,53 +109,36 @@ class OAKDObjectDetector:
         # Obtener nombres de clases de YOLO
         self.class_names = self.model.names
         
-        # Inicializar reconocimiento de voz (inicializar como None primero)
+        # Inicializar reconocimiento de voz (solo para cuando pregunte "¿Deseas preguntar algo?")
         self.recognizer = None
         self.microphone = None
-        
         print("Inicializando reconocimiento de voz...")
-        # Suprimir mensajes de ALSA durante la inicialización
-        import contextlib
-        
-        # Suprimir ALSA completamente durante la inicialización
         old_stderr = sys.stderr
         try:
             sys.stderr = open(os.devnull, 'w')
             try:
                 self.recognizer = sr.Recognizer()
-                
-                # Buscar el micrófono H390 específicamente
                 mic_list = sr.Microphone.list_microphone_names()
                 h390_index = None
                 for i, mic_name in enumerate(mic_list):
                     if 'logi' in mic_name.lower() or 'h390' in mic_name.lower() or 'usb headset' in mic_name.lower():
                         h390_index = i
-                        print(f"  Micrófono H390 encontrado: [{i}] {mic_name}")
                         break
-                
-                if h390_index is not None:
-                    self.microphone = sr.Microphone(device_index=h390_index)
-                    print(f"  ✓ Usando micrófono H390 (índice {h390_index})")
-                else:
-                    # Si no se encuentra, usar índice 0 que suele ser el H390
-                    self.microphone = sr.Microphone(device_index=0)
-                    print(f"  ⚠ H390 no encontrado por nombre, usando índice 0 (puede ser el H390)")
-                
-                # Ajustar para ruido ambiente (más tiempo para mejor calibración)
-                print("Ajustando micrófono para ruido ambiente (3 segundos)...")
+                self.microphone = sr.Microphone(device_index=h390_index if h390_index is not None else 0)
                 with self.microphone as source:
-                    self.recognizer.adjust_for_ambient_noise(source, duration=3)
-                # Ajustar umbral de energía para ser más sensible a la voz
-                self.recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.5, 100)
-                print(f"✓ Reconocimiento de voz inicializado (umbral: {self.recognizer.energy_threshold:.0f})")
+                    self.recognizer.adjust_for_ambient_noise(source, duration=2)
+                self.recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.6, 150)
+                print("  ✓ Micrófono listo (se activa cuando pregunte '¿Deseas preguntar algo?')")
             except Exception as e:
-                print(f"⚠ Advertencia: Error inicializando micrófono: {e}")
-                print("   El reconocimiento de voz puede no funcionar correctamente")
+                print(f"  ⚠ Micrófono no disponible: {e}")
                 self.recognizer = None
                 self.microphone = None
-                print("✓ Reconocimiento de voz inicializado (deshabilitado)")
         finally:
-            sys.stderr.close()
+            try:
+                if sys.stderr is not old_stderr:
+                    sys.stderr.close()
+            except Exception:
+                pass
             sys.stderr = old_stderr
         
         # Cola para comandos de voz
@@ -164,6 +151,22 @@ class OAKDObjectDetector:
         # Objetos detectados actualmente (para responder preguntas)
         self.current_objects = {}
         self.objects_lock = threading.Lock()
+
+        # OCR automático de carteles (sin que el usuario diga nada)
+        self.ocr_reader = None
+        self.ocr_last_announce_time = 0.0
+        self.ocr_last_text_key = ""
+        self.ocr_check_every_n_frames = 30  # Reduce carga: OCR no se hace en cada frame
+        self.ocr_cooldown_seconds = 30       # Evita repetir el mismo cartel seguido
+        self.ocr_min_confidence = 0.45
+        self.ocr_max_chars = 90
+        self.ocr_max_words = 12
+        self.last_listen_end_time = 0.0  # Evita que el OCR hable justo después de escuchar al usuario
+        self.ocr_in_progress = False
+        self.ocr_thread_lock = threading.Lock()
+        # Último frame útil para OCR cuando el usuario lo pide por voz
+        self.last_frame_for_ocr = None
+        self.last_frame_count_for_ocr = 0
         
         # Configurar auricular H390 como dispositivo de salida por defecto
         print("Configurando auricular H390 como dispositivo de audio...")
@@ -193,65 +196,15 @@ class OAKDObjectDetector:
             print(f"  ⚠ No se pudo configurar auricular automáticamente: {e}")
             print("  Ejecuta: ./configurar_auricular.sh")
         
-        # Inicializar síntesis de voz
+        # Síntesis de voz: en Jetson pyttsx3/espeak provoca Abortado (SIGABRT).
+        # Deshabilitada aquí; puedes usar espeak por terminal si quieres voz:
+        #   espeak -v es "Texto a decir"
         print("Inicializando síntesis de voz...")
-        try:
-            self.tts_engine = pyttsx3.init()
-            
-            # Configurar propiedades de voz
-            voices = self.tts_engine.getProperty('voices')
-            # Intentar usar voz en español si está disponible
-            voz_encontrada = False
-            for voice in voices:
-                if 'spanish' in voice.name.lower() or 'español' in voice.name.lower():
-                    self.tts_engine.setProperty('voice', voice.id)
-                    voz_encontrada = True
-                    print(f"  Usando voz: {voice.name}")
-                    break
-            
-            if not voz_encontrada and len(voices) > 0:
-                print(f"  Usando voz por defecto: {voices[0].name}")
-            
-            # Configurar velocidad y volumen
-            self.tts_engine.setProperty('rate', 150)  # Velocidad de habla
-            self.tts_engine.setProperty('volume', 1.0)  # Volumen máximo (0.0 a 1.0)
-            
-            # Asegurar que el auricular esté configurado antes de probar
-            try:
-                import subprocess
-                result = subprocess.run(['pactl', 'list', 'short', 'sinks'], 
-                                      capture_output=True, text=True, timeout=1)
-                for line in result.stdout.split('\n'):
-                    if 'logi' in line.lower() or 'h390' in line.lower():
-                        h390_sink = line.split()[1]
-                        subprocess.run(['pactl', 'set-default-sink', h390_sink], 
-                                     capture_output=True, timeout=1)
-                        subprocess.run(['pactl', 'set-sink-volume', h390_sink, '100%'], 
-                                     capture_output=True, timeout=1)
-                        break
-            except:
-                pass
-            
-            # Probar que funciona
-            print("  Probando síntesis de voz...")
-            print("  (Deberías escuchar: 'Síntesis de voz funcionando')")
-            self.tts_engine.say("Síntesis de voz funcionando")
-            self.tts_engine.runAndWait()
-            print("  ✓ Prueba completada")
-            
-            # Thread para hablar (evita bloquear la detección)
-            self.tts_lock = threading.Lock()
-            self.last_spoken = {}  # Para evitar repetir demasiado
-            self.last_spoken_time = {}  # Timestamp de última vez que se habló
-            
-            print("✓ Síntesis de voz inicializada y funcionando")
-        except Exception as e:
-            print(f"✗ Error inicializando síntesis de voz: {e}")
-            print("  El programa continuará pero no hablará los objetos")
-            self.tts_engine = None
-            self.tts_lock = threading.Lock()
-            self.last_spoken = {}
-            self.last_spoken_time = {}
+        self.tts_engine = None  # Deshabilitado para evitar abort en Jetson
+        self.tts_lock = threading.Lock()
+        self.last_spoken = {}
+        self.last_spoken_time = {}
+        print("  ✓ Síntesis deshabilitada (evita abort). El programa mostrará detección por pantalla.")
         
         # Inicializar GPS
         print("Inicializando GPS...")
@@ -1124,7 +1077,6 @@ class OAKDObjectDetector:
         if current_time - self.last_summary_time > 10.0:
             self.last_summary_time = current_time
             return True
-        
         return False
     
     def detect_obstaculos_proximos(self, objetos, distancia_umbral=2.0):
@@ -1204,6 +1156,214 @@ class OAKDObjectDetector:
             resumen += ". No hay obstáculos próximos"
         
         return resumen
+
+    def _ocr_normalize(self, text):
+        """Normaliza texto OCR para comparar y para leerlo mejor."""
+        if text is None:
+            return ""
+        t = str(text)
+        # Mantener letras, números y puntuación básica; reemplazar separadores por espacios
+        t = re.sub(r"[\r\n\t]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _ocr_spanish_like(self, text, conf_max):
+        """Heurística simple para aceptar texto probable en español."""
+        if not text:
+            return False
+        t = text.lower()
+        # Si tiene caracteres típicos de español, es buena señal
+        if re.search(r"[áéíóúñ]", t, flags=re.IGNORECASE):
+            return True
+        # Palabras/indicadores comunes de carteles en español
+        markers = [
+            " el ", " la ", " los ", " las ", " una ", " un ",
+            " por ", " para ", " con ", " sin ", " donde ", " donde ",
+            " atención", " aviso", " favor", " prohib",
+            " entrada", " salida", " horario", " baño", " farmacia",
+            " hospital", " restaurante", " dirección", " piso"
+        ]
+        if any(m in t for m in markers):
+            return True
+        # Si tiene caracteres típicos o marcadores ya devolvimos True.
+        # Si no, aceptamos si la confianza es razonablemente alta.
+        # (Más permisivo para no dejar pasar carteles reales.)
+        return conf_max >= max(0.75, self.ocr_min_confidence + 0.25)
+
+    def _ensure_ocr_reader(self):
+        if self.ocr_reader is not None:
+            return self.ocr_reader
+        # EasyOCR carga un modelo; evitar hacerlo en cada frame
+        import easyocr
+        # gpu=False: más seguro en Orin Nano si no queremos forzar CUDA
+        self.ocr_reader = easyocr.Reader(["es"], gpu=False)
+        return self.ocr_reader
+
+    def _ocr_job(self, frame, frame_count):
+        """OCR en background para no bloquear el loop principal."""
+        try:
+            now = time.time()
+            # No hablar/leer si estamos esperando al usuario
+            with self.user_speaking_lock:
+                if self.user_speaking:
+                    return
+
+            roi = frame
+            h, w = roi.shape[:2]
+            # Recortar a zona central amplia: reduce ruido pero no pierde carteles
+            y1, y2 = int(h * 0.05), int(h * 0.95)
+            x1, x2 = int(w * 0.05), int(w * 0.95)
+            roi = roi[y1:y2, x1:x2]
+            if roi.size == 0:
+                return
+
+            # Asegurar tamaño mínimo para OCR
+            min_dim = min(roi.shape[:2])
+            if min_dim < 250:
+                scale = 2.0
+                roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+            reader = self._ensure_ocr_reader()
+            rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+
+            results = reader.readtext(rgb, detail=1, paragraph=False)
+            if not results:
+                return
+
+            raw_texts = []
+            for _, text_raw, conf_raw in results[:5]:
+                tn = self._ocr_normalize(text_raw)
+                if tn:
+                    raw_texts.append((tn, float(conf_raw) if conf_raw is not None else 0.0))
+            if raw_texts:
+                print(f"🧾 OCR raw (top): {raw_texts}")
+
+            candidates = []
+            conf_max = 0.0
+            for bbox, text, conf in results:
+                t = self._ocr_normalize(text)
+                if not t:
+                    continue
+                if conf is None:
+                    continue
+                conf_f = float(conf)
+                conf_max = max(conf_max, conf_f)
+                if conf_f < self.ocr_min_confidence:
+                    continue
+                if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", t, flags=re.IGNORECASE):
+                    continue
+                if len(t) < 3:
+                    continue
+                candidates.append((bbox, t, conf_f))
+
+            if not candidates:
+                # Best-effort: si easyocr detecta texto pero lo descartó por confianza,
+                # intentamos anunciar el fragmento más legible a partir del raw_texts.
+                # (Esto evita quedarnos en silencio cuando el cartel es poco nítido.)
+                fallback_words = []
+                for tn, _conf in raw_texts:
+                    for w_ in tn.split():
+                        w_ = w_.strip()
+                        if len(w_) < 3:
+                            continue
+                        if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", w_, flags=re.IGNORECASE):
+                            continue
+                        if not re.search(r"[aeiouáéíóú]", w_, flags=re.IGNORECASE):
+                            continue
+                        fallback_words.append(w_)
+                        if len(fallback_words) >= self.ocr_max_words:
+                            break
+                    if len(fallback_words) >= self.ocr_max_words:
+                        break
+
+                if not fallback_words:
+                    return
+
+                texto = " ".join(fallback_words)[: self.ocr_max_chars].strip()
+                texto_key = re.sub(r"[^a-zA-Z0-9ÁÉÍÓÚÑáéíóúñ ]+", "", texto).lower()
+                texto_key = re.sub(r"\s+", " ", texto_key).strip()
+                if texto_key == self.ocr_last_text_key:
+                    return
+
+                mensaje = f"Hay un cartel que dice: {texto}"
+                print(f"\n🪧 CARTEL LEÍDO (OCR, best effort): {texto}\n")
+                self.ocr_last_text_key = texto_key
+                self.ocr_last_announce_time = now
+                self.speak_text_sync(mensaje)
+                return
+
+            candidates_top = sorted(candidates, key=lambda x: x[2], reverse=True)[:6]
+            candidates_top.sort(key=lambda x: (x[0][0][1] + x[0][2][1]) / 2.0)
+
+            words = []
+            for _, t, _ in candidates_top:
+                for w_ in t.split():
+                    w_ = w_.strip()
+                    if not w_:
+                        continue
+                    if len(w_) == 1 and not re.match(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", w_, flags=re.IGNORECASE):
+                        continue
+                    words.append(w_)
+                    if len(words) >= self.ocr_max_words:
+                        break
+                if len(words) >= self.ocr_max_words:
+                    break
+
+            if not words:
+                return
+
+            texto = " ".join(words)
+            texto = texto[: self.ocr_max_chars].strip()
+            texto_key = re.sub(r"[^a-zA-Z0-9ÁÉÍÓÚÑáéíóúñ ]+", "", texto).lower()
+            texto_key = re.sub(r"\s+", " ", texto_key).strip()
+
+            if not self._ocr_spanish_like(texto, conf_max):
+                return
+            if texto_key == self.ocr_last_text_key:
+                return
+
+            mensaje = f"Hay un cartel que dice: {texto}"
+            print(f"\n🪧 CARTEL LEÍDO (OCR): {texto}\n")
+
+            # Actualizar cooldown antes de hablar
+            self.ocr_last_text_key = texto_key
+            self.ocr_last_announce_time = now
+
+            # Hablar sin bloquear el loop principal (estamos en thread)
+            self.speak_text_sync(mensaje)
+        except Exception as e:
+            print(f"🧾 OCR error: {e}")
+        finally:
+            with self.ocr_thread_lock:
+                self.ocr_in_progress = False
+
+    def try_auto_read_cartel(self, frame, frame_count):
+        """
+        Dispara el OCR en background para leer automáticamente un cartel en español.
+        """
+        try:
+            now = time.time()
+            with self.user_speaking_lock:
+                if self.user_speaking:
+                    return
+            if frame_count % self.ocr_check_every_n_frames != 0:
+                return
+            if now - self.ocr_last_announce_time < self.ocr_cooldown_seconds:
+                return
+            if now - getattr(self, "last_listen_end_time", 0.0) < 8.0:
+                return
+            if hasattr(self, "last_summary_time") and (now - getattr(self, "last_summary_time", 0)) < 4.0:
+                return
+
+            with self.ocr_thread_lock:
+                if self.ocr_in_progress:
+                    return
+                self.ocr_in_progress = True
+
+            frame_copy = frame.copy()
+            threading.Thread(target=self._ocr_job, args=(frame_copy, frame_count), daemon=True).start()
+        except Exception:
+            return
     
     def listen_for_commands(self):
         """Escucha comandos de voz en un thread separado"""
@@ -1318,6 +1478,31 @@ class OAKDObjectDetector:
                         print(f"Error escuchando: {e}")
                 time.sleep(0.1)
     
+    def listen_once(self, timeout_seconds=6):
+        """Escucha una sola frase (para cuando pregunta '¿Deseas preguntar algo?'). Devuelve texto o None."""
+        if self.microphone is None or self.recognizer is None:
+            return None
+        try:
+            import contextlib
+            with open(os.devnull, 'w') as devnull:
+                old_err = sys.stderr
+                sys.stderr = devnull
+                try:
+                    with self.microphone as source:
+                        audio = self.recognizer.listen(source, timeout=timeout_seconds, phrase_time_limit=5)
+                    text = self.recognizer.recognize_google(audio, language='es-ES')
+                    return text.strip().lower() if text else None
+                except sr.WaitTimeoutError:
+                    return None
+                except sr.UnknownValueError:
+                    return None
+                except sr.RequestError:
+                    return None
+                finally:
+                    sys.stderr = old_err
+        except Exception:
+            return None
+    
     def process_voice_command(self, command):
         """Procesa un comando de voz y responde"""
         # El usuario está hablando, mantener bandera activa durante el procesamiento
@@ -1368,32 +1553,18 @@ class OAKDObjectDetector:
                 respuesta = "Apagando el sistema. Hasta luego."
                 print(f"📢 Respuesta: {respuesta}")
                 
-                # Para el comando de apagado, hablar directamente (sin thread) para asegurar que termine
-                if self.tts_engine is not None:
-                    try:
-                        # Asegurar que el auricular esté configurado
-                        try:
-                            import subprocess
-                            result = subprocess.run(['pactl', 'list', 'short', 'sinks'], 
-                                                  capture_output=True, text=True, timeout=0.5)
-                            for line in result.stdout.split('\n'):
-                                if 'logi' in line.lower() or 'h390' in line.lower():
-                                    h390_sink = line.split()[1]
-                                    subprocess.run(['pactl', 'set-default-sink', h390_sink], 
-                                                 capture_output=True, timeout=0.5)
-                                    subprocess.run(['pactl', 'set-sink-volume', h390_sink, '100%'], 
-                                                 capture_output=True, timeout=0.5)
-                                    break
-                        except:
-                            pass
-                        
-                        # Hablar directamente y ESPERAR a que termine
+                # Mensaje de despedida (espeak si no hay pyttsx3)
+                try:
+                    import subprocess
+                    if self.tts_engine is not None:
                         with self.tts_lock:
                             self.tts_engine.say(respuesta)
-                            self.tts_engine.runAndWait()  # Esperar a que termine de hablar
-                        print("📢 Mensaje de despedida completado")
-                    except Exception as e:
-                        print(f"⚠ Error al hablar despedida: {e}")
+                            self.tts_engine.runAndWait()
+                    else:
+                        subprocess.run(["espeak", "-v", "es", respuesta], capture_output=True, timeout=5)
+                    print("📢 Mensaje de despedida completado")
+                except Exception as e:
+                    print(f"⚠ Error al hablar despedida: {e}")
                 
                 # Desactivar bandera
                 with self.user_speaking_lock:
@@ -1405,6 +1576,38 @@ class OAKDObjectDetector:
                 # Detener el programa
                 self.running = False
                 return True
+
+        # OCR bajo demanda: si el usuario dice "cartel", leer el texto del último frame
+        if re.search(r"\bcartel\b", command_lower):
+            # Aviso inmediato para que el usuario entienda que ahora está leyendo
+            try:
+                self.speak_text_sync("Estoy leyendo el cartel.")
+            except:
+                pass
+            # Pequeña espera: ayuda a que el frame del cartel sea más estable
+            time.sleep(1.0)
+            if self.last_frame_for_ocr is None:
+                respuesta = "No puedo ver un cartel ahora mismo."
+                print(f"📢 Respuesta: {respuesta}")
+                self.speak_text(respuesta, force=True)
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                return False
+
+            try:
+                # Evitar que OCR se ejecute a la vez (por si acaso)
+                with self.ocr_thread_lock:
+                    if self.ocr_in_progress:
+                        return False
+                    self.ocr_in_progress = True
+                self._ocr_job(self.last_frame_for_ocr, self.last_frame_count_for_ocr)
+            finally:
+                with self.ocr_thread_lock:
+                    self.ocr_in_progress = False
+
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return False
         
         # Comandos GPS
         gps_patterns = [
@@ -1598,14 +1801,16 @@ class OAKDObjectDetector:
     
     def speak_text(self, text, force=False):
         """
-        Habla un texto usando síntesis de voz
-        
-        Args:
-            text: Texto a hablar
-            force: Si es True, habla incluso si el usuario está hablando (para respuestas a preguntas)
+        Habla un texto usando síntesis de voz (espeak si no hay pyttsx3, para SSH/embebido).
         """
         def _speak():
             try:
+                import subprocess
+                # Sin pyttsx3 (modo SSH/embebido): usar espeak, no aborta
+                if self.tts_engine is None:
+                    with self.tts_lock:
+                        subprocess.run(["espeak", "-v", "es", text], capture_output=True, timeout=15)
+                    return
                 # Si no es forzado, verificar si el usuario está hablando
                 if not force:
                     with self.user_speaking_lock:
@@ -1645,68 +1850,65 @@ class OAKDObjectDetector:
         thread = threading.Thread(target=_speak, daemon=True)
         thread.start()
     
+    def speak_text_sync(self, text):
+        """Habla y espera a que termine (no superpone con lo siguiente). Para el ciclo '¿Deseas preguntar algo?'"""
+        try:
+            import subprocess
+            if self.tts_engine is None:
+                with self.tts_lock:
+                    subprocess.run(["espeak", "-v", "es", text], capture_output=True, timeout=30)
+            else:
+                with self.tts_lock:
+                    self.tts_engine.say(text)
+                    self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"Error al hablar (sync): {e}")
+    
     def run(self):
         """Ejecuta el loop principal de detección"""
         print("\n" + "="*60)
         print("DETECCIÓN DE OBJETOS INICIADA")
         print("="*60)
-        print("\n📹 Ventana de video abierta")
-        print("🔊 Audio: El programa hablará un resumen cada 10 segundos")
-        print("   - Dice qué objetos ve y sus distancias")
-        print("   - Indica si hay obstáculos próximos (menos de 2 metros)")
-        print("   - Detecta y anuncia desniveles en el suelo (escalones, bordillos, inclinaciones)")
-        print("   - Descansa 10 segundos entre cada mensaje")
-        print("🎤 Micrófono: Puedes hacer preguntas por voz")
-        print("   Ejemplos: '¿Estás viendo una silla?' o '¿A qué distancia está la persona?'")
-        print("   GPS: '¿Dónde estoy?' o '¿Cuál es mi ubicación?'")
-        print("⌨️  CONTROLES:")
-        print("   • Presiona 'Q', 'q' o ESC en la ventana de video para SALIR")
-        print("   • O presiona Ctrl+C en esta terminal para SALIR")
-        print("   • O cierra la ventana de video para SALIR")
-        print("\n" + "="*60 + "\n")
-        
-        # Iniciar thread para escuchar comandos de voz (solo si el micrófono está disponible)
-        if self.microphone is not None and self.recognizer is not None:
-            voice_thread = threading.Thread(target=self.listen_for_commands, daemon=True)
-            voice_thread.start()
-            print("✓ Micrófono activado, puedes hacer preguntas ahora")
-            print("  Ejemplos: '¿Estás viendo una silla?' o '¿A qué distancia está la persona?'")
-            print("  Habla claramente cerca del micrófono\n")
-        else:
-            print("⚠ Micrófono no disponible, reconocimiento de voz deshabilitado")
-            print("  El programa seguirá funcionando pero no podrás hacer preguntas por voz\n")
+        print("\n📹 Detección activa (por SSH: ventana en pantalla virtual, no visible)")
+        print("🔊 Audio: Resumen por voz cada 10 s (espeak). Conecta auricular/speaker en la Jetson.")
+        print("   - Objetos y distancias, obstáculos próximos, desniveles en el suelo")
+        print("🎤 Micrófono: Comandos por voz (si está conectado)")
+        print("⌨️  PARA SALIR: Ctrl+C en esta terminal, o di 'terminar'/'apagar' cuando pregunte '¿Deseas preguntar algo?'")
+        print("   Cada 4 ciclos de lo que ve, te preguntará si quieres preguntar algo y ahí podrás hablar.\n")
+        print("="*60 + "\n")
         
         frame_count = 0
         start_time = time.time()
         window_created = False
+        summary_cycle_count = 0  # Cada 4 ciclos pregunta "¿Deseas preguntar algo?" y activa el micrófono
+        gui_enabled = True  # OpenCV puede venir en versión "headless" sin soporte de HighGUI
         
         try:
             while self.running:
                 # Verificar tecla PRIMERO (más responsivo)
-                if window_created:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q') or key == ord('Q') or key == 27:  # 'q', 'Q' o ESC
-                        print("\n" + "="*60)
-                        print("SALIENDO... (Presionaste 'Q' o ESC)")
-                        print("="*60)
-                        self.running = False
-                        break
-                    
-                    # Verificar si la ventana fue cerrada
+                if window_created and gui_enabled:
                     try:
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q') or key == ord('Q') or key == 27:  # 'q', 'Q' o ESC
+                            print("\n" + "="*60)
+                            print("SALIENDO... (Presionaste 'Q' o ESC)")
+                            print("="*60)
+                            self.running = False
+                            break
+                        
+                        # Verificar si la ventana fue cerrada
                         if cv2.getWindowProperty("Detección de Objetos - OAK-D Lite", cv2.WND_PROP_VISIBLE) < 1:
                             print("\n" + "="*60)
                             print("SALIENDO... (Ventana cerrada)")
                             print("="*60)
                             self.running = False
                             break
-                    except:
-                        self.running = False
-                        break
+                    except Exception:
+                        # Si la ventana no se puede consultar por falta de GUI, pasamos a headless
+                        gui_enabled = False
                 
                 # Verificar si hay frames disponibles antes de obtenerlos
                 if not self.q_rgb.has() or not self.q_depth.has():
-                    # Verificar running antes de sleep
                     if not self.running:
                         break
                     time.sleep(0.01)  # Pequeña pausa para no saturar CPU
@@ -1721,7 +1923,6 @@ class OAKDObjectDetector:
                     in_rgb = self.q_rgb.tryGet()
                     in_depth = self.q_depth.tryGet()
                     
-                    # Si no hay frames disponibles, continuar
                     if in_rgb is None or in_depth is None:
                         continue
                 except Exception as e:
@@ -1729,24 +1930,29 @@ class OAKDObjectDetector:
                         print(f"Error obteniendo frames: {e}")
                     continue
                 
-                # Convertir a numpy arrays
                 frame = in_rgb.getCvFrame()
                 depth_frame = in_depth.getFrame()
+                # Guardar último frame para OCR bajo demanda (cuando el usuario diga "cartel")
+                self.last_frame_for_ocr = frame
+                self.last_frame_count_for_ocr = frame_count
                 
-                # Crear ventana si no existe
-                if not window_created:
-                    cv2.namedWindow("Detección de Objetos - OAK-D Lite", cv2.WINDOW_NORMAL)
-                    window_created = True
-                    print("✓ Ventana de video creada")
+                # Crear ventana si no existe (solo si aún creemos que hay GUI)
+                if not window_created and gui_enabled:
+                    try:
+                        cv2.namedWindow("Detección de Objetos - OAK-D Lite", cv2.WINDOW_NORMAL)
+                        window_created = True
+                        print("✓ Ventana de video creada")
+                    except Exception as e:
+                        gui_enabled = False
+                        window_created = False
+                        print(f"⚠ OpenCV sin soporte de ventana (headless). Ejecutando sin GUI. Detalle: {e}")
                 
-                # Verificar running antes de procesar
                 if not self.running:
                     break
                 
                 # Ejecutar detección YOLO
                 results = self.model(frame, verbose=False)
                 
-                # Verificar running después de YOLO (puede tardar)
                 if not self.running:
                     break
                 
@@ -1758,9 +1964,7 @@ class OAKDObjectDetector:
                 if frame_count % 5 == 0:
                     desnivel_info = self.detect_desniveles_suelo(depth_frame)
                     
-                    # Anunciar desnivel si es significativo y no se anunció recientemente
                     if desnivel_info['hay_desnivel']:
-                        # Solo anunciar si es diferente al anterior o han pasado 30 frames (aprox 1 segundo)
                         mensaje_actual = desnivel_info['mensaje']
                         if (mensaje_actual != self.ultimo_desnivel_anunciado or 
                             (frame_count - self.frame_desnivel_anterior) > 30):
@@ -1768,8 +1972,6 @@ class OAKDObjectDetector:
                             self.speak_text(f"Atención: {mensaje_actual}", force=True)
                             self.ultimo_desnivel_anunciado = mensaje_actual
                             self.frame_desnivel_anterior = frame_count
-                            
-                            # Dibujar advertencia visual en el frame
                             cv2.putText(frame, "DESNIVEL!", (10, 50), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                             cv2.putText(frame, desnivel_info['mensaje'], (10, 90), 
@@ -1784,7 +1986,6 @@ class OAKDObjectDetector:
                             'confianza': obj['confianza']
                         }
                 
-                # Mostrar información de objetos detectados (cada 10 frames para no saturar)
                 if frame_count % 10 == 0:
                     if objetos:
                         print(f"\n--- Frame {frame_count} ---")
@@ -1797,55 +1998,94 @@ class OAKDObjectDetector:
                         if desnivel_info and desnivel_info['hay_desnivel']:
                             print(f"  ⚠️  Desnivel: {desnivel_info['mensaje']}")
                 
-                # Hablar resumen cada 10 segundos (con descanso)
+                # Hablar resumen cada 10 segundos (lo que ve)
                 if objetos:
                     if self.should_speak_summary():
+                        summary_cycle_count += 1
                         resumen = self.generar_resumen_voz(objetos)
                         print(f"\n🔊 RESUMEN: {resumen}")
-                        self.speak_text(resumen)
+                        if summary_cycle_count % 4 == 0:
+                            # Ciclo 4: hablar y esperar a que termine, luego preguntar y escuchar (sin superponer)
+                            self.speak_text_sync(resumen)
+                            # Siempre preguntar en ciclo 4.
+                            # El lock de audio evita que el OCR y la pregunta se solapen.
+                            self.speak_text_sync("¿Deseas preguntar algo?")
+                            print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
+                            with self.user_speaking_lock:
+                                self.user_speaking = True
+                            user_text = self.listen_once(timeout_seconds=6)
+                            with self.user_speaking_lock:
+                                self.user_speaking = False
+                            self.last_listen_end_time = time.time()
+                            if user_text:
+                                print(f"\n🎤 Dijiste: {user_text}\n")
+                                self.process_voice_command(user_text)
+                                if not self.running:
+                                    break
+                        else:
+                            self.speak_text(resumen)
                 else:
                     if self.should_speak_summary():
-                        resumen = "No estoy viendo ningún objeto en este momento. No hay obstáculos próximos"
+                        summary_cycle_count += 1
+                        # Si acabamos de leer un cartel (o el OCR aún está en progreso),
+                        # evita repetir "no veo nada" justo después.
+                        ocr_in_prog = False
+                        try:
+                            with self.ocr_thread_lock:
+                                ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
+                        except:
+                            ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
+                        if ocr_in_prog or (time.time() - getattr(self, "ocr_last_announce_time", 0.0)) < 15.0:
+                            resumen = "Estoy leyendo un cartel."
+                        else:
+                            resumen = "No estoy viendo ningún objeto en este momento. No hay obstáculos próximos"
                         print(f"\n🔊 RESUMEN: {resumen}")
-                        self.speak_text(resumen)
+                        if summary_cycle_count % 4 == 0:
+                            self.speak_text_sync(resumen)
+                            # Siempre preguntar en ciclo 4.
+                            self.speak_text_sync("¿Deseas preguntar algo?")
+                            print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
+                            with self.user_speaking_lock:
+                                self.user_speaking = True
+                            user_text = self.listen_once(timeout_seconds=6)
+                            with self.user_speaking_lock:
+                                self.user_speaking = False
+                            self.last_listen_end_time = time.time()
+                            if user_text:
+                                print(f"\n🎤 Dijiste: {user_text}\n")
+                                self.process_voice_command(user_text)
+                                if not self.running:
+                                    break
+                        else:
+                            self.speak_text(resumen)
                 
-                # Procesar comandos de voz pendientes
-                try:
-                    while not self.voice_commands.empty():
-                        command = self.voice_commands.get_nowait()
-                        self.process_voice_command(command)
-                except queue.Empty:
-                    pass
-                
-                # Calcular y mostrar FPS
                 frame_count += 1
                 if frame_count % 30 == 0:
                     elapsed = time.time() - start_time
                     fps = 30 / elapsed
                     print(f"FPS: {fps:.2f}")
                     start_time = time.time()
+
+                # OCR automático desactivado: ahora solo se lee cuando el usuario lo pide (ej. dice "cartel")
                 
-                # Agregar instrucciones visibles en el frame
                 h, w = frame.shape[:2]
-                # Fondo semi-transparente para el texto
                 overlay = frame.copy()
                 cv2.rectangle(overlay, (10, 10), (350, 80), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-                
-                # Texto de instrucciones
                 cv2.putText(frame, "Presiona 'Q' o ESC para SALIR", (20, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, "O di 'APAGAR' por voz", (20, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
                 
-                # Verificar running antes de mostrar
                 if not self.running:
                     break
                 
-                # Mostrar frame
-                cv2.imshow("Detección de Objetos - OAK-D Lite", frame)
-                
-                # waitKey ya se ejecutó al inicio del loop, no es necesario aquí
+                if gui_enabled:
+                    try:
+                        cv2.imshow("Detección de Objetos - OAK-D Lite", frame)
+                    except Exception:
+                        # Si imshow falla (por headless), desactivamos GUI
+                        gui_enabled = False
                     
         except KeyboardInterrupt:
             print("\n" + "="*60)
@@ -1867,7 +2107,8 @@ class OAKDObjectDetector:
             
             # Detener el motor de voz si está hablando
             try:
-                self.tts_engine.stop()
+                if self.tts_engine is not None:
+                    self.tts_engine.stop()
             except:
                 pass
             
