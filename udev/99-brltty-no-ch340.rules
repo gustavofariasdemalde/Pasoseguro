@@ -1,0 +1,9 @@
+# Evita que ModemManager y otros subsistemas traten mal el CH340; ayuda con GPS USB.
+# Copiar a: /etc/udev/rules.d/99-brltty-no-ch340.rules
+# Luego: sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Nota: si el paquete brltty sigue instalado, puede seguir interfiriendo.
+# Lo fiable es: sudo apt purge brltty
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_IGNORE}="1"

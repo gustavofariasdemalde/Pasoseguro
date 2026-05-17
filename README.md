@@ -91,8 +91,8 @@ El programa responderá con frases como:
 - "Sí, estoy viendo silla a 2.5 metros"
 - "Sí, estoy viendo persona a 1.2 metros"
 - "No, no estoy viendo [objeto] en este momento"
-- "Estoy en Avenida Principal 123, Barrio Centro, Ciudad. Coordenadas: 34.0522 grados Norte, 118.2437 grados Oeste"
-- "Mi ubicación es: 34.0522 grados Norte, 118.2437 grados Oeste" (si no se puede obtener la dirección)
+- "Estoy cerca de Avenida Principal 123, Barrio Centro, Ciudad." (solo dirección por voz cuando hay geocodificación)
+- "Ubicación por satélite: 34.052 grados Norte, 118.243 grados Oeste" (si no se puede obtener la dirección)
 - "No tengo señal GPS en este momento. Asegúrate de estar al aire libre"
 
 ## Modelos YOLO Disponibles
@@ -143,6 +143,11 @@ El programa muestra:
 ### Errores de importación
 - Asegúrate de tener todas las dependencias instaladas: `pip install -r requirements.txt`
 - Verifica que estés usando Python 3.8 o superior
+
+### OCR (leer carteles con “cartel”)
+- La primera vez EasyOCR descarga modelos (`es` + `en` por defecto).
+- Si **cuesta leer letras**: acerca el cartel, buena luz, sin reflejos; el código ya **amplía la imagen** y aplica **contraste (CLAHE)** en dos pasadas.
+- Variables opcionales (Jetson): `OCR_MIN_SIDE=600` (más escala), `OCR_MAG_RATIO=2.5`, `OCR_LANGS=es` (solo español, menos RAM), `OCR_GPU=1` (si CUDA va bien).
 
 ### La síntesis de voz no funciona
 - Asegúrate de tener espeak-ng instalado: `sudo apt-get install -y espeak-ng espeak-ng-data`

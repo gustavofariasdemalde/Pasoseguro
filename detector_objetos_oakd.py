@@ -91,9 +91,10 @@ class OAKDObjectDetector:
                 print("="*60)
             raise
         
-        # Obtener colas de salida (con timeout para evitar bloqueos)
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
-        self.q_depth = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+        # Colas pequeñas + no bloqueo: menos frames encolados = imagen más “actual”
+        # (con maxSize alto, tryGet devuelve el frame más viejo y suma latencia).
+        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
+        self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=False)
         
         # Flag para controlar el loop
         self.running = True
@@ -158,12 +159,15 @@ class OAKDObjectDetector:
         self.ocr_last_text_key = ""
         self.ocr_check_every_n_frames = 30  # Reduce carga: OCR no se hace en cada frame
         self.ocr_cooldown_seconds = 30       # Evita repetir el mismo cartel seguido
-        self.ocr_min_confidence = 0.45
-        self.ocr_max_chars = 90
-        self.ocr_max_words = 12
+        # Umbral más bajo: EasyOCR suele dar scores bajos en letras pequeñas / carteles
+        self.ocr_min_confidence = 0.28
+        self.ocr_max_chars = 120
+        self.ocr_max_words = 18
         self.last_listen_end_time = 0.0  # Evita que el OCR hable justo después de escuchar al usuario
         self.ocr_in_progress = False
         self.ocr_thread_lock = threading.Lock()
+        self.ocr_reader_lock = threading.Lock()
+        self._ocr_voice_cancelled = False
         # Último frame útil para OCR cuando el usuario lo pide por voz
         self.last_frame_for_ocr = None
         self.last_frame_count_for_ocr = 0
@@ -212,6 +216,8 @@ class OAKDObjectDetector:
         self.gps_location = None
         self.gps_lock = threading.Lock()
         self.gps_thread = None
+        self.gps_probe_baud = None  # baud detectado al sondear NMEA (find_gps_port)
+        self._gps_last_lazy_attempt = 0.0  # throttle para reintento al pedir ubicación
         
         # Inicializar geocodificador para obtener direcciones
         try:
@@ -265,182 +271,373 @@ class OAKDObjectDetector:
                     print("  O si es la primera vez: sudo ./configurar_gps_permanente.sh")
             
             if gps_port:
-                # Intentar múltiples baudrates comunes para GPS
-                baudrates = [4800, 9600, 38400, 115200]
-                gps_connected = False
-                for baudrate in baudrates:
-                    try:
-                        self.gps_serial = serial.Serial(gps_port, baudrate=baudrate, timeout=1)
-                        print(f"  ✓ GPS conectado en: {gps_port} (baudrate: {baudrate})")
-                        gps_connected = True
-                        break
-                    except serial.SerialException as e:
-                        if baudrate == baudrates[-1]:  # Último intento
-                            print(f"  ✗ Error conectando GPS en {gps_port}: {e}")
-                            print(f"     Probados baudrates: {baudrates}")
-                        continue
-                
-                if gps_connected:
-                    # Iniciar thread para leer GPS
-                    self.gps_thread = threading.Thread(target=self.read_gps_data, daemon=True)
-                    self.gps_thread.start()
+                if self._open_gps_serial_and_thread(gps_port):
                     print("  ✓ GPS iniciado, leyendo datos...")
                     print("  ℹ El GPS necesita estar al aire libre para recibir señal de satélites")
                 else:
                     self.gps_serial = None
-                    print("  ⚠ No se pudo conectar al GPS, funcionalidad deshabilitada")
+                    print("  ⚠ No se pudo abrir el puerto GPS; se reintentará al preguntar dónde estás")
             else:
                 print("  ⚠ GPS no encontrado, funcionalidad deshabilitada")
                 print("  Conecta el módulo GPS por USB y ejecuta: ./activar_gps.sh")
+                print(
+                    "  ℹ Modem Huawei + GPS: el primer ttyUSB suele ser el módem. "
+                    "Forzá el GPS con: export GPS_SERIAL_PORT=/dev/ttyUSB1"
+                )
         except Exception as e:
             print(f"  ⚠ Error inicializando GPS: {e}")
             import traceback
             traceback.print_exc()
             print("  La funcionalidad GPS estará deshabilitada")
             self.gps_serial = None
-    
-    def find_gps_port(self):
-        """Busca el puerto serial del GPS"""
-        print("  Buscando puerto GPS...")
-        import glob
-        
-        # Intentar múltiples veces (el puerto puede tardar en aparecer)
-        for intento in range(3):
-            # Primero, buscar directamente en /dev/ttyUSB* (más confiable)
-            usb_ports = glob.glob('/dev/ttyUSB*')
-            if usb_ports:
-                if intento == 0:
-                    print(f"  Encontrados puertos USB: {usb_ports}")
-            for port in sorted(usb_ports):
-                if os.path.exists(port):
-                    try:
-                        # Verificar permisos
-                        if not os.access(port, os.R_OK | os.W_OK):
-                            if intento == 0:
-                                print(f"  ⚠ Puerto {port} existe pero no tiene permisos (ejecuta: sudo chmod 666 {port})")
-                            continue
-                        # Intentar abrir para verificar que es un puerto serial válido
-                        test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
-                        test_serial.close()
-                        print(f"  ✓ Puerto {port} encontrado y accesible")
-                        return port
-                    except serial.SerialException as e:
-                        if intento == 0:
-                            print(f"  ⚠ Puerto {port} no se puede abrir: {e}")
-                        continue
-                    except (OSError, PermissionError) as e:
-                        if intento == 0:
-                            print(f"  ⚠ Error de permisos en {port}: {e}")
-                            print(f"     Ejecuta: sudo chmod 666 {port}")
-                        continue
-            
-            # Si no se encontró, esperar un poco y reintentar
-            if intento < 2:
-                time.sleep(1)
-        
-        # Si no se encuentra en /dev/ttyUSB*, buscar en puertos ACM
-        acm_ports = glob.glob('/dev/ttyACM*')
-        if acm_ports:
-            print(f"  Encontrados puertos ACM: {acm_ports}")
-        for port in sorted(acm_ports):
-            if os.path.exists(port):
-                try:
-                    if not os.access(port, os.R_OK | os.W_OK):
-                        continue
-                    test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
-                    test_serial.close()
-                    print(f"  ✓ Puerto {port} encontrado y accesible")
-                    return port
-                except (serial.SerialException, OSError, PermissionError):
-                    continue
-        
-        # Como último recurso, buscar en la lista de puertos de Python
-        print("  Buscando en lista de puertos del sistema...")
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            # Buscar por descripción o nombre
-            desc = port.description.lower()
-            print(f"  Puerto encontrado: {port.device} - {port.description}")
-            if 'gps' in desc or 'usb' in desc or 'serial' in desc or 'ch340' in desc or 'ch34' in desc:
-                try:
-                    if not os.access(port.device, os.R_OK | os.W_OK):
-                        print(f"  ⚠ Puerto {port.device} no tiene permisos")
-                        continue
-                    test_serial = serial.Serial(port.device, baudrate=4800, timeout=0.5)
-                    test_serial.close()
-                    print(f"  ✓ Puerto {port.device} encontrado y accesible")
-                    return port.device
-                except (serial.SerialException, OSError, PermissionError) as e:
-                    print(f"  ⚠ Puerto {port.device} no se puede abrir: {e}")
-                    continue
-        
-        # Si no se encuentra, probar puertos comunes
-        print("  Probando puertos comunes...")
-        common_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1']
-        for port in common_ports:
-            if os.path.exists(port):
-                try:
-                    if not os.access(port, os.R_OK | os.W_OK):
-                        continue
-                    test_serial = serial.Serial(port, baudrate=4800, timeout=0.5)
-                    test_serial.close()
-                    print(f"  ✓ Puerto {port} encontrado y accesible")
-                    return port
-                except:
-                    continue
-        
-        print("  ✗ No se encontró ningún puerto GPS accesible")
-        print("  Sugerencias:")
-        print("    1. Ejecuta: ./activar_gps.sh")
-        print("    2. Verifica que el GPS esté conectado: lsusb | grep CH340")
-        print("    3. Verifica permisos: ls -la /dev/ttyUSB*")
-        return None
-    
-    def parse_nmea(self, nmea_sentence):
-        """Parsea una oración NMEA para extraer coordenadas GPS"""
+
+        # EasyOCR: primera carga puede tardar minutos y bloquea el hilo → precarga en background
+        def _preload_ocr():
+            try:
+                os.environ.setdefault("OMP_NUM_THREADS", "2")
+                os.environ.setdefault("MKL_NUM_THREADS", "2")
+                print("🧾 OCR: precargando modelo (la primera vez descarga pesos)...", flush=True)
+                self._ensure_ocr_reader()
+                print("🧾 OCR: precarga lista.", flush=True)
+            except Exception as ex:
+                print(f"🧾 OCR: precarga omitida o falló: {ex}", flush=True)
+
+        if os.environ.get("OCR_PRELOAD", "1").strip().lower() not in (
+            "0",
+            "no",
+            "false",
+            "off",
+        ):
+            threading.Thread(target=_preload_ocr, daemon=True).start()
+
+    def _gps_modem_tty_set(self):
+        """tty* que no debemos usar como GPS (Huawei E3372, Quectel, etc.)."""
+        skip = set()
+        extra = os.environ.get("GPS_SKIP_PORTS", "").strip()
+        if extra:
+            for p in extra.split(","):
+                p = p.strip()
+                if p:
+                    skip.add(p)
         try:
-            if nmea_sentence.startswith('$GPGGA'):
-                parts = nmea_sentence.split(',')
-                if len(parts) >= 10 and parts[2] and parts[4]:  # Tiene latitud y longitud
-                    # Latitud (formato: DDMM.MMMM)
-                    lat_str = parts[2]
-                    if len(lat_str) >= 4:
-                        lat_deg = float(lat_str[:2])
-                        lat_min = float(lat_str[2:])
-                        latitude = lat_deg + lat_min / 60.0
-                        # Corregir: permitir tanto 'N' como 'S'
-                        if parts[3] == 'S':
-                            latitude = -latitude
-                        elif parts[3] != 'N':
-                            return None  # Solo si no es N ni S
+            for p in serial.tools.list_ports.comports():
+                hw = (p.hwid or "").upper().replace(" ", "")
+                if "VID:PID=12D1:" in hw or "VID_12D1&PID_" in hw:
+                    skip.add(p.device)
+                for vid in ("1199", "2C7C", "1BC7", "05C6", "1E0E"):
+                    if f"VID:PID={vid}:" in hw or f"VID_{vid}&" in hw:
+                        skip.add(p.device)
+        except Exception:
+            pass
+        return skip
+
+    def _probe_gps_nmea_baud(self, port):
+        """Devuelve baud si en el puerto aparece NMEA (GGA/RMC); si no, None."""
+        bauds = [9600, 115200, 38400, 4800, 57600]
+        env_b = os.environ.get("GPS_PROBE_BAUDS", "").strip()
+        if env_b:
+            try:
+                bauds = [int(x.strip()) for x in env_b.split(",") if x.strip()]
+            except ValueError:
+                pass
+        try:
+            per = float(os.environ.get("GPS_PROBE_SEC_PER_BAUD", "1.4"))
+        except ValueError:
+            per = 1.4
+        per = max(0.35, min(4.5, per))
+        for baud in bauds:
+            ser = None
+            try:
+                ser = serial.Serial(port, baudrate=baud, timeout=0.12)
+                try:
+                    ser.reset_input_buffer()
+                except Exception:
+                    pass
+                t_end = time.time() + per
+                buf = ""
+                while time.time() < t_end:
+                    n = ser.in_waiting
+                    if n:
+                        buf += ser.read(n).decode("utf-8", errors="ignore")
+                        # Sin fix aún puede no haber GGA/RMC completo; basta con tramas GPS típicas
+                        if ("$GP" in buf or "$GN" in buf) and any(
+                            t in buf
+                            for t in (
+                                "GGA",
+                                "RMC",
+                                "GSA",
+                                "GSV",
+                                "VTG",
+                                "TXT",
+                            )
+                        ):
+                            ser.close()
+                            return baud
                     else:
-                        return None
-                    
-                    # Longitud (formato: DDDMM.MMMM)
-                    lon_str = parts[4]
-                    if len(lon_str) >= 5:
-                        lon_deg = float(lon_str[:3])
-                        lon_min = float(lon_str[3:])
-                        longitude = lon_deg + lon_min / 60.0
-                        # Corregir: permitir tanto 'E' como 'W'
-                        if parts[5] == 'W':
-                            longitude = -longitude
-                        elif parts[5] != 'E':
-                            return None  # Solo si no es E ni W
-                    else:
-                        return None
-                    
-                    # Calidad de señal
-                    quality = int(parts[6]) if parts[6] else 0
-                    
-                    if quality > 0:  # Solo si hay señal GPS válida
-                        return {
-                            'latitude': latitude,
-                            'longitude': longitude,
-                            'quality': quality,
-                            'timestamp': time.time()
-                        }
-        except Exception as e:
+                        time.sleep(0.02)
+                ser.close()
+            except Exception:
+                try:
+                    if ser is not None and getattr(ser, "is_open", False):
+                        ser.close()
+                except Exception:
+                    pass
+        return None
+
+    def find_gps_port(self):
+        """
+        Encuentra el GPS por texto NMEA real. El Huawei E3372 abre como ttyUSB*
+        pero no manda GGA/RMC; antes el primer ttyUSB ganaba y el GPS quedaba mal.
+        """
+        print("  Buscando puerto GPS (se ignoran modems LTE conocidos y se exige NMEA)...")
+        import glob
+
+        self.gps_probe_baud = None
+        modem_skip = self._gps_modem_tty_set()
+        if modem_skip:
+            print(f"  Puertos no-GPS (modem / GPS_SKIP_PORTS): {sorted(modem_skip)}")
+
+        forced = os.environ.get("GPS_SERIAL_PORT", "").strip()
+        trust = os.environ.get("GPS_TRUST_PORT", "").strip().lower() in ("1", "yes", "true")
+
+        if forced:
+            if not os.path.exists(forced):
+                print(f"  ✗ GPS_SERIAL_PORT={forced} no existe")
+                return None
+            if not os.access(forced, os.R_OK | os.W_OK):
+                print(f"  ✗ Sin permisos en {forced} (sudo chmod 666 {forced})")
+                return None
+            if trust:
+                print(f"  ✓ GPS_SERIAL_PORT={forced} (GPS_TRUST_PORT=1, sin sondeo NMEA)")
+                return forced
+            baud = self._probe_gps_nmea_baud(forced)
+            if baud is not None:
+                self.gps_probe_baud = baud
+                print(f"  ✓ {forced} OK — NMEA a {baud} baud")
+                return forced
+            print(f"  ✗ {forced} no envió NMEA; revisá baud o cable")
+            return None
+
+        preferred = []
+        try:
+            for p in serial.tools.list_ports.comports():
+                if p.device in modem_skip:
+                    continue
+                d = (p.description or "").lower()
+                if any(
+                    k in d
+                    for k in (
+                        "ch340",
+                        "ch341",
+                        "ch34",
+                        "gps",
+                        "ublox",
+                        "serial adapter",
+                        "cp210",
+                        "ftdi",
+                    )
+                ):
+                    if p.device not in preferred:
+                        preferred.append(p.device)
+        except Exception:
+            pass
+
+        candidates = []
+        seen = set()
+        for dev in preferred:
+            if dev not in seen and os.path.exists(dev) and dev not in modem_skip:
+                candidates.append(dev)
+                seen.add(dev)
+        for dev in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+            if dev in modem_skip or dev in seen:
+                continue
+            candidates.append(dev)
+            seen.add(dev)
+
+        for intento in range(2):
+            for port in candidates:
+                try:
+                    if not os.access(port, os.R_OK | os.W_OK):
+                        if intento == 0:
+                            print(f"  ⚠ {port} sin permisos (chmod 666 o regla udev)")
+                        continue
+                except OSError:
+                    continue
+                baud = self._probe_gps_nmea_baud(port)
+                if baud is not None:
+                    self.gps_probe_baud = baud
+                    print(f"  ✓ GPS en {port} ({baud} baud)")
+                    return port
+            if intento == 0:
+                time.sleep(0.9)
+
+        print("  ✗ Ningún puerto devolvió tramas NMEA reconocibles")
+        all_tty = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        cand = [x for x in all_tty if x not in modem_skip]
+        print(f"  Puertos USB/ACM en el sistema: {all_tty or '(ninguno)'}")
+        print(f"  Candidatos GPS (sin contar modem): {cand or '(ninguno — revisá cable o permisos)'}")
+        if not all_tty:
+            print("  ⚠ Sin /dev/ttyUSB* con CH340: si dmesg dice «brltty» al enchufar:")
+            print("     brltty lo lanza udev (no siempre aparece en systemctl). Solución:")
+            print("       sudo apt purge brltty brltty-x11  &&  sudo killall brltty 2>/dev/null")
+            print("       sudo udevadm control --reload-rules && sudo udevadm trigger")
+            print("     O en este repo: ./fix_gps_brltty.sh   — luego desenchufá y enchufá el GPS.")
+            print("     Luego: ls -la /dev/ttyUSB0")
+            print("     (Huawei HiLink suele no usar ttyUSB; el GPS usa el CH340.)")
+        print("  Sugerencias:")
+        print("    lsusb | grep -i serial;  ls -la /dev/ttyUSB* /dev/ttyACM* 2>/dev/null")
+        print("    (Si existe: ls -l /dev/serial/by-id/)")
+        print("    export GPS_SERIAL_PORT=/dev/ttyUSB1   # el del GPS, no el Huawei")
+        print("    export GPS_TRUST_PORT=1 && reiniciar el programa")
+        print("    permisos: sudo chmod 666 /dev/ttyUSB*   o regla udev")
+        return None
+
+    def _open_gps_serial_and_thread(self, gps_port):
+        """Abre el serial del GPS y arranca el hilo de lectura (arranque o reintento)."""
+        if not gps_port or self.gps_serial is not None:
+            return self.gps_serial is not None
+        baudrates = [4800, 9600, 38400, 115200]
+        if self.gps_probe_baud:
+            baudrates = [self.gps_probe_baud] + [
+                b for b in baudrates if b != self.gps_probe_baud
+            ]
+        for baudrate in baudrates:
+            try:
+                self.gps_serial = serial.Serial(gps_port, baudrate=baudrate, timeout=1)
+                print(f"  ✓ GPS conectado en: {gps_port} (baudrate: {baudrate})", flush=True)
+                self.gps_thread = threading.Thread(target=self.read_gps_data, daemon=True)
+                self.gps_thread.start()
+                return True
+            except serial.SerialException as e:
+                self.gps_serial = None
+                if baudrate == baudrates[-1]:
+                    print(f"  ✗ No se pudo abrir {gps_port}: {e}", flush=True)
+                continue
+        return False
+
+    def try_connect_gps_lazy(self, reason=""):
+        """
+        Si al iniciar no hubo GPS (USB lento, sin fix, sondeo corto), reintenta al pedir ubicación.
+        No toca cámara ni OCR.
+        Returns:
+            1 = conectado (o ya estaba)
+            2 = esperá (throttle; reintentá en unos segundos)
+            0 = falló la detección o apertura
+        """
+        if self.gps_serial is not None:
+            return 1
+        try:
+            gap = float(os.environ.get("GPS_LAZY_RETRY_SEC", "5"))
+        except ValueError:
+            gap = 5.0
+        gap = max(2.0, min(120.0, gap))
+        now = time.time()
+        if now - self._gps_last_lazy_attempt < gap and self._gps_last_lazy_attempt > 0:
+            return 2
+        self._gps_last_lazy_attempt = now
+        print(f"📍 GPS: reintento de conexión ({reason})...", flush=True)
+        gps_port = self.find_gps_port()
+        if not gps_port:
+            forced = os.environ.get("GPS_SERIAL_PORT", "").strip()
+            trust = os.environ.get("GPS_TRUST_PORT", "").strip().lower() in (
+                "1",
+                "yes",
+                "true",
+            )
+            if (
+                forced
+                and trust
+                and os.path.exists(forced)
+                and os.access(forced, os.R_OK | os.W_OK)
+            ):
+                print(
+                    f"📍 GPS: abriendo {forced} con GPS_TRUST_PORT (sin sondeo NMEA)...",
+                    flush=True,
+                )
+                gps_port = forced
+            else:
+                print(
+                    "📍 GPS: no apareció ningún puerto con tramas NMEA. "
+                    "Configurá GPS_SERIAL_PORT y GPS_TRUST_PORT y reiniciá.",
+                    flush=True,
+                )
+                return 0
+        if self._open_gps_serial_and_thread(gps_port):
+            print(
+                "📍 GPS: conectado. Si acabás de salir a la calle, esperá unos segundos al fix.",
+                flush=True,
+            )
+            return 1
+        return 0
+
+    def _parse_nmea_lat_lon_from_dm(self, lat_str, ns, lon_str, ew):
+        """lat_str / lon_str en formato NMEA DDMM.MMMM y DDDMM.MMMM."""
+        if not lat_str or len(lat_str) < 4:
+            return None
+        lat_deg = float(lat_str[:2])
+        lat_min = float(lat_str[2:])
+        latitude = lat_deg + lat_min / 60.0
+        if ns == "S":
+            latitude = -latitude
+        elif ns != "N":
+            return None
+        if not lon_str or len(lon_str) < 5:
+            return None
+        lon_deg = float(lon_str[:3])
+        lon_min = float(lon_str[3:])
+        longitude = lon_deg + lon_min / 60.0
+        if ew == "W":
+            longitude = -longitude
+        elif ew != "E":
+            return None
+        return latitude, longitude
+
+    def parse_nmea(self, nmea_sentence):
+        """GGA / RMC, talkers GP y GN (módulos multi-constelación)."""
+        try:
+            line = nmea_sentence.strip()
+            if not line.startswith("$"):
+                return None
+            parts = line.split(",")
+            if len(parts) < 6:
+                return None
+            head = parts[0].upper()
+            if head.endswith("GGA"):
+                if len(parts) < 10 or not parts[2] or not parts[4]:
+                    return None
+                coords = self._parse_nmea_lat_lon_from_dm(
+                    parts[2], parts[3], parts[4], parts[5]
+                )
+                if coords is None:
+                    return None
+                latitude, longitude = coords
+                quality = int(parts[6]) if parts[6] else 0
+                if quality <= 0:
+                    return None
+                return {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "quality": quality,
+                    "timestamp": time.time(),
+                }
+            if head.endswith("RMC"):
+                if len(parts) < 7:
+                    return None
+                if parts[2] != "A":
+                    return None
+                coords = self._parse_nmea_lat_lon_from_dm(
+                    parts[3], parts[4], parts[5], parts[6]
+                )
+                if coords is None:
+                    return None
+                latitude, longitude = coords
+                return {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "quality": 1,
+                    "timestamp": time.time(),
+                }
+        except Exception:
             pass
         return None
     
@@ -469,20 +666,28 @@ class OAKDObjectDetector:
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         line = line.strip()
-                        if line.startswith('$GP'):
+                        p0 = line.split(",")[0] if "," in line else ""
+                        if p0.startswith("$G") and ("GGA" in p0 or "RMC" in p0):
                             nmea_count += 1
-                            # Mostrar primera línea NMEA recibida como confirmación
                             if nmea_count == 1:
-                                print(f"  ✓ GPS: Recibiendo datos NMEA (primera línea: {line[:50]}...)")
-                            
+                                print(
+                                    f"  ✓ GPS: NMEA ({p0[:8]}…): {line[:56]}...",
+                                    flush=True,
+                                )
                             location = self.parse_nmea(line)
                             if location:
                                 with self.gps_lock:
                                     self.gps_location = location
-                                    print(f"📍 GPS: Lat {location['latitude']:.6f}, Lon {location['longitude']:.6f} (calidad: {location['quality']})")
-                            # Mostrar estado cada 30 segundos si no hay señal
+                                    print(
+                                        f"📍 GPS: Lat {location['latitude']:.6f}, Lon {location['longitude']:.6f} "
+                                        f"(calidad: {location['quality']})",
+                                        flush=True,
+                                    )
                             elif time.time() - last_status_print > 30:
-                                print("📡 GPS recibiendo datos pero sin señal de satélites (necesita estar al aire libre)")
+                                print(
+                                    "📡 GPS: tramas sin posición fija todavía (cielo abierto ayuda)",
+                                    flush=True,
+                                )
                                 last_status_print = time.time()
                 else:
                     # Verificar si no hay datos por mucho tiempo
@@ -502,81 +707,107 @@ class OAKDObjectDetector:
                 time.sleep(1)
     
     def get_location_text(self):
-        """Obtiene la ubicación actual en formato texto con dirección"""
-        # Verificar si el GPS está conectado
+        """
+        Devuelve (texto_para_voz, texto_extra_consola o None).
+        El texto de voz va corto para no cortar espeak por timeout.
+        """
         if not self.gps_serial:
-            return "El módulo GPS no está conectado. Conecta el GPS por USB y reinicia el programa"
-        
+            lazy_rc = self.try_connect_gps_lazy("pregunta de ubicación")
+            if not self.gps_serial:
+                if lazy_rc == 2:
+                    return (
+                        "Esperá unos segundos y preguntá otra vez dónde estoy.",
+                        None,
+                    )
+                voz = "No detecto el GPS. Revisá la consola para configurar el puerto."
+                consola = (
+                    "  → export GPS_SERIAL_PORT=/dev/ttyUSB0 (o 1, 2: el módulo GPS, no el modem)\n"
+                    "  → export GPS_TRUST_PORT=1\n"
+                    "  → reiniciar el programa (identificá el GPS con: lsusb y ls -la /dev/ttyUSB*)"
+                )
+                return (voz, consola)
+
         with self.gps_lock:
-            if self.gps_location:
-                lat = self.gps_location['latitude']
-                lon = self.gps_location['longitude']
-                quality = self.gps_location['quality']
-                
-                # Intentar obtener dirección (geocodificación inversa)
-                direccion = None
-                if self.geolocator:
-                    try:
-                        location_info = self.geolocator.reverse((lat, lon), timeout=5, language='es')
-                        if location_info:
-                            address = location_info.raw.get('address', {})
-                            
-                            # Construir dirección legible
-                            partes_direccion = []
-                            
-                            # Calle y número
-                            if 'road' in address or 'street' in address:
-                                calle = address.get('road') or address.get('street', '')
-                                numero = address.get('house_number', '')
-                                if numero:
-                                    partes_direccion.append(f"{calle} {numero}")
-                                elif calle:
-                                    partes_direccion.append(calle)
-                            
-                            # Barrio o suburbio
-                            if 'suburb' in address:
-                                partes_direccion.append(address['suburb'])
-                            elif 'neighbourhood' in address:
-                                partes_direccion.append(address['neighbourhood'])
-                            
-                            # Ciudad
-                            if 'city' in address:
-                                partes_direccion.append(address['city'])
-                            elif 'town' in address:
-                                partes_direccion.append(address['town'])
-                            elif 'village' in address:
-                                partes_direccion.append(address['village'])
-                            
-                            # Provincia/Estado
-                            if 'state' in address:
-                                partes_direccion.append(address['state'])
-                            
-                            if partes_direccion:
-                                direccion = ", ".join(partes_direccion)
-                    except Exception as e:
-                        # Si falla la geocodificación, continuar sin dirección
-                        pass
-                
-                # Formatear respuesta
-                if direccion:
-                    # Formatear coordenadas también
-                    lat_dir = "Norte" if lat >= 0 else "Sur"
-                    lon_dir = "Este" if lon >= 0 else "Oeste"
-                    lat_abs = abs(lat)
-                    lon_abs = abs(lon)
-                    
-                    return f"Estoy en {direccion}. Coordenadas: {lat_abs:.4f} grados {lat_dir}, {lon_abs:.4f} grados {lon_dir}"
-                else:
-                    # Si no se pudo obtener dirección, solo coordenadas
-                    lat_dir = "Norte" if lat >= 0 else "Sur"
-                    lon_dir = "Este" if lon >= 0 else "Oeste"
-                    lat_abs = abs(lat)
-                    lon_abs = abs(lon)
-                    
-                    return f"Mi ubicación es: {lat_abs:.4f} grados {lat_dir}, {lon_abs:.4f} grados {lon_dir}"
+            snap = dict(self.gps_location) if self.gps_location else None
+
+        if not snap:
+            return (
+                "GPS sin señal de satélites todavía. Probá al aire libre unos segundos.",
+                None,
+            )
+
+        lat = snap["latitude"]
+        lon = snap["longitude"]
+
+        direccion = None
+        skip_geo = os.environ.get("GPS_SKIP_GEOCODE", "").strip().lower() in (
+            "1",
+            "yes",
+            "true",
+        )
+        if self.geolocator and not skip_geo:
+            try:
+                try:
+                    tmo = int(os.environ.get("GPS_GEOCODE_TIMEOUT", "2"))
+                except ValueError:
+                    tmo = 2
+                tmo = max(1, min(8, tmo))
+                location_info = self.geolocator.reverse((lat, lon), timeout=tmo, language="es")
+                if location_info:
+                    address = location_info.raw.get("address", {})
+                    partes_direccion = []
+                    if "road" in address or "street" in address:
+                        calle = address.get("road") or address.get("street", "")
+                        numero = address.get("house_number", "")
+                        if numero:
+                            partes_direccion.append(f"{calle} {numero}")
+                        elif calle:
+                            partes_direccion.append(calle)
+                    if "suburb" in address:
+                        partes_direccion.append(address["suburb"])
+                    elif "neighbourhood" in address:
+                        partes_direccion.append(address["neighbourhood"])
+                    if "city" in address:
+                        partes_direccion.append(address["city"])
+                    elif "town" in address:
+                        partes_direccion.append(address["town"])
+                    elif "village" in address:
+                        partes_direccion.append(address["village"])
+                    if "state" in address:
+                        partes_direccion.append(address["state"])
+                    if partes_direccion:
+                        direccion = ", ".join(partes_direccion)
+            except Exception:
+                pass
+
+        lat_dir = "Norte" if lat >= 0 else "Sur"
+        lon_dir = "Este" if lon >= 0 else "Oeste"
+        lat_abs = abs(lat)
+        lon_abs = abs(lon)
+        if direccion:
+            # Solo dirección por voz (truncar si supera límite de espeak).
+            prefix = "Estoy cerca de "
+            suffix = "."
+            max_total = 220
+            room = max_total - len(prefix) - len(suffix)
+            if room < 10:
+                room = 10
+            if len(direccion) <= room:
+                dir_out = direccion
             else:
-                # GPS conectado pero sin señal
-                return "El GPS está conectado pero no tiene señal de satélites. Necesito estar al aire libre para recibir señal GPS. El WiFi no es suficiente, necesito ver los satélites"
+                chunk = direccion[:room]
+                last_comma = chunk.rfind(",")
+                if last_comma > room // 3:
+                    dir_out = chunk[:last_comma].strip()
+                else:
+                    dir_out = chunk.rstrip()
+            voz = f"{prefix}{dir_out}{suffix}"
+            return (voz, None)
+        voz = (
+            f"Ubicación por satélite: {lat_abs:.3f} grados {lat_dir}, "
+            f"{lon_abs:.3f} grados {lon_dir}."
+        )
+        return (voz, None)
     
     def _signal_handler(self, signum, frame):
         """Maneja señales para detener el programa correctamente"""
@@ -628,6 +859,57 @@ class OAKDObjectDetector:
         stereo.depth.link(xout_depth.input)
         
         return pipeline
+
+    def _map_rgb_box_to_depth(self, x1, y1, x2, y2, rgb_shape, depth_shape):
+        """
+        YOLO usa el frame RGB (preview); el mapa de profundidad suele ser OTRO tamaño
+        aunque esté alineado al RGB. Sin escalar, el centro del bbox apunta al fondo
+        equivocado (ej. persona a 40 cm y lectura de pared a 4 m).
+        """
+        rh, rw = int(rgb_shape[0]), int(rgb_shape[1])
+        dh, dw = int(depth_shape[0]), int(depth_shape[1])
+        if rw <= 0 or rh <= 0:
+            return int(x1), int(y1), int(x2), int(y2)
+        sx = dw / float(rw)
+        sy = dh / float(rh)
+        dx1 = int(np.clip(round(x1 * sx), 0, dw - 1))
+        dy1 = int(np.clip(round(y1 * sy), 0, dh - 1))
+        dx2 = int(np.clip(round(x2 * sx), 0, dw - 1))
+        dy2 = int(np.clip(round(y2 * sy), 0, dh - 1))
+        if dx2 < dx1:
+            dx1, dx2 = dx2, dx1
+        if dy2 < dy1:
+            dy1, dy2 = dy2, dy1
+        return dx1, dy1, dx2, dy2
+
+    def get_distance_in_bbox(
+        self, depth_frame, x1, y1, x2, y2, percentile=50, max_mm=15000
+    ):
+        """
+        Distancia en metros a partir de todos los píxeles válidos dentro del bbox
+        (coordenadas ya en espacio del depth frame). Percentil bajo (~30) prioriza
+        superficies más cercanas (útil para persona vs fondo).
+        """
+        if depth_frame is None:
+            return None
+        x1, x2 = sorted([int(x1), int(x2)])
+        y1, y2 = sorted([int(y1), int(y2)])
+        H, W = depth_frame.shape[:2]
+        x1 = max(0, min(W - 1, x1))
+        x2 = max(0, min(W - 1, x2))
+        y1 = max(0, min(H - 1, y1))
+        y2 = max(0, min(H - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        region = depth_frame[y1 : y2 + 1, x1 : x2 + 1]
+        valid = region[(region > 0) & (region < max_mm)]
+        if len(valid) < 3:
+            return None
+        d_mm = float(np.percentile(valid, np.clip(percentile, 5, 95)))
+        distance_m = d_mm / 1000.0
+        if distance_m < 0.08 or distance_m > 12.0:
+            return None
+        return distance_m
     
     def get_distance_at_point(self, depth_frame, x, y):
         """
@@ -636,7 +918,7 @@ class OAKDObjectDetector:
         
         Args:
             depth_frame: Frame de profundidad
-            x, y: Coordenadas del punto
+            x, y: Coordenadas del punto **en píxeles del depth frame**
             
         Returns:
             Distancia en metros, o None si no es válida
@@ -832,6 +1114,54 @@ class OAKDObjectDetector:
         
         return resultado
     
+    @staticmethod
+    def _iou_bbox_xyxy(a, b):
+        """IoU entre dos cajas [x1,y1,x2,y2]."""
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        iw = max(0, x2 - x1)
+        ih = max(0, y2 - y1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+        area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _dedupe_objetos_misma_clase(self, raw_objetos, iou_threshold=0.4, centro_px_max=55, dist_m_max=0.35):
+        """
+        Evita contar dos veces el mismo objeto (p. ej. dos cajas YOLO sobre una persona).
+        Por clase: se queda la detección con mayor confianza y descarta duplicados por IoU o
+        proximidad de centro + distancia similar.
+        """
+        if len(raw_objetos) <= 1:
+            return raw_objetos
+        by_class = {}
+        for o in raw_objetos:
+            by_class.setdefault(o["nombre"], []).append(o)
+        salida = []
+        for _cls, grupo in by_class.items():
+            grupo = sorted(grupo, key=lambda x: -x["confianza"])
+            mantener = []
+            for cand in grupo:
+                dup = False
+                cx, cy = cand["center_x"], cand["center_y"]
+                for k in mantener:
+                    if self._iou_bbox_xyxy(cand["bbox"], k["bbox"]) >= iou_threshold:
+                        dup = True
+                        break
+                    dpx = ((cx - k["center_x"]) ** 2 + (cy - k["center_y"]) ** 2) ** 0.5
+                    if dpx <= centro_px_max and abs(cand["distancia"] - k["distancia"]) <= dist_m_max:
+                        dup = True
+                        break
+                if not dup:
+                    mantener.append(cand)
+            salida.extend(mantener)
+        return salida
+
     def draw_detections(self, frame, results, depth_frame):
         """
         Dibuja las detecciones y distancias en el frame
@@ -841,89 +1171,115 @@ class OAKDObjectDetector:
             results: Resultados de YOLO
             depth_frame: Frame de profundidad
         """
-        objetos_detectados = []
-        
+        raw = []
+        rgb_shape = frame.shape
+        dshape = depth_frame.shape
+
         for result in results:
             boxes = result.boxes
             for box in boxes:
-                # Obtener coordenadas del bounding box
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                
-                # Obtener clase y confianza
+
                 cls = int(box.cls[0].cpu().numpy())
                 conf = float(box.conf[0].cpu().numpy())
                 class_name = self.class_names[cls]
-                
-                # Calcular el centro del objeto
+
                 center_x = int((x1 + x2) / 2)
                 center_y = int((y1 + y2) / 2)
-                
-                # Obtener distancia en el centro del objeto
-                # Si falla, intentar en la parte inferior del objeto (más cerca del suelo)
-                distance = self.get_distance_at_point(depth_frame, center_x, center_y)
-                
-                # Si la distancia es inválida o 0, intentar en la parte inferior del bounding box
+
+                dx1, dy1, dx2, dy2 = self._map_rgb_box_to_depth(
+                    x1, y1, x2, y2, rgb_shape, dshape
+                )
+                dcx = (dx1 + dx2) // 2
+                dcy = (dy1 + dy2) // 2
+
+                # Persona: muestrear torso (zona central) + percentil cercano; evita leer el fondo.
+                if class_name == "person":
+                    bw, bh = dx2 - dx1, dy2 - dy1
+                    distance = None
+                    if bw > 6 and bh > 6:
+                        ix1 = int(dx1 + bw * 0.22)
+                        ix2 = int(dx2 - bw * 0.22)
+                        iy1 = int(dy1 + bh * 0.12)
+                        iy2 = int(dy2 - bh * 0.28)
+                        distance = self.get_distance_in_bbox(
+                            depth_frame, ix1, iy1, ix2, iy2, percentile=28
+                        )
+                    if distance is None:
+                        distance = self.get_distance_in_bbox(
+                            depth_frame, dx1, dy1, dx2, dy2, percentile=32
+                        )
+                    if distance is None:
+                        distance = self.get_distance_at_point(depth_frame, dcx, dcy)
+                else:
+                    distance = self.get_distance_at_point(depth_frame, dcx, dcy)
+
                 if distance is None or distance < 0.1:
-                    # Probar en la parte inferior del objeto (más cerca del suelo)
-                    bottom_y = min(y2 - 5, depth_frame.shape[0] - 1)  # 5 píxeles desde el borde inferior
-                    distance = self.get_distance_at_point(depth_frame, center_x, bottom_y)
-                
-                # Almacenar información del objeto solo si la distancia es válida
+                    bottom_dy = min(dy2 - max(1, (dy2 - dy1) // 25), dshape[0] - 1)
+                    distance = self.get_distance_at_point(depth_frame, dcx, bottom_dy)
+
                 if distance is not None and distance >= 0.1:
-                    objetos_detectados.append({
-                        'nombre': class_name,
-                        'distancia': distance,
-                        'confianza': conf
+                    raw.append({
+                        "nombre": class_name,
+                        "distancia": distance,
+                        "confianza": conf,
+                        "bbox": (x1, y1, x2, y2),
+                        "center_x": center_x,
+                        "center_y": center_y,
                     })
-                    
-                    # Dibujar bounding box
-                    color = (0, 255, 0)  # Verde
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    
-                    # Preparar texto con información
-                    label = f"{class_name} {conf:.2f}"
-                    distance_text = f"{distance:.2f}m"
-                    
-                    # Obtener tamaño del texto
-                    (text_width, text_height), baseline = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                    )
-                    
-                    # Dibujar fondo para el texto
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1 - text_height - baseline - 20),
-                        (x1 + text_width + 10, y1),
-                        color,
-                        -1
-                    )
-                    
-                    # Dibujar texto de clase y confianza
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1 + 5, y1 - baseline - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 0),
-                        1
-                    )
-                    
-                    # Dibujar texto de distancia
-                    cv2.putText(
-                        frame,
-                        distance_text,
-                        (x1 + 5, y1 - baseline + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 0),
-                        1
-                    )
-                    
-                    # Dibujar punto central
-                    cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
-        
+
+        dedup = self._dedupe_objetos_misma_clase(raw)
+
+        objetos_detectados = []
+        color = (0, 255, 0)
+        for o in dedup:
+            x1, y1, x2, y2 = o["bbox"]
+            conf = o["confianza"]
+            class_name = o["nombre"]
+            distance = o["distancia"]
+            center_x, center_y = o["center_x"], o["center_y"]
+
+            objetos_detectados.append({
+                "nombre": class_name,
+                "distancia": distance,
+                "confianza": conf,
+            })
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            label = f"{class_name} {conf:.2f}"
+            distance_text = f"{distance:.2f}m"
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            cv2.rectangle(
+                frame,
+                (x1, y1 - text_height - baseline - 20),
+                (x1 + text_width + 10, y1),
+                color,
+                -1,
+            )
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 5, y1 - baseline - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                1,
+            )
+            cv2.putText(
+                frame,
+                distance_text,
+                (x1 + 5, y1 - baseline + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                1,
+            )
+            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+
         return objetos_detectados
     
     def speak_object(self, nombre, distancia):
@@ -1142,7 +1498,10 @@ class OAKDObjectDetector:
                 dist_texto = f"{distancia_promedio:.1f} metros"
             
             if len(distancias) > 1:
-                mensajes.append(f"{len(distancias)} {nombre_es} a {dist_texto}")
+                nm = nombre_es
+                if nm == "persona":
+                    nm = "personas"
+                mensajes.append(f"{len(distancias)} {nm} a {dist_texto}")
             else:
                 mensajes.append(f"{nombre_es} a {dist_texto}")
         
@@ -1167,11 +1526,18 @@ class OAKDObjectDetector:
         t = re.sub(r"\s+", " ", t).strip()
         return t
 
-    def _ocr_spanish_like(self, text, conf_max):
+    def _ocr_spanish_like(self, text, conf_max, for_voice_command=False):
         """Heurística simple para aceptar texto probable en español."""
         if not text:
             return False
         t = text.lower()
+        # Por voz: el usuario pidió leer; no descartar carteles en inglés, números o sin tildes
+        if for_voice_command:
+            if len(t.strip()) >= 2 and re.search(
+                r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]", t, flags=re.IGNORECASE
+            ):
+                return conf_max >= max(0.2, self.ocr_min_confidence - 0.08)
+            return False
         # Si tiene caracteres típicos de español, es buena señal
         if re.search(r"[áéíóúñ]", t, flags=re.IGNORECASE):
             return True
@@ -1185,53 +1551,221 @@ class OAKDObjectDetector:
         ]
         if any(m in t for m in markers):
             return True
-        # Si tiene caracteres típicos o marcadores ya devolvimos True.
-        # Si no, aceptamos si la confianza es razonablemente alta.
-        # (Más permisivo para no dejar pasar carteles reales.)
-        return conf_max >= max(0.75, self.ocr_min_confidence + 0.25)
+        # Texto latino / números sin marcadores típicos: aceptar si hay confianza suficiente
+        if len(text) >= 4 and re.search(r"[a-záéíóúñ0-9]", t, flags=re.IGNORECASE):
+            return conf_max >= max(0.32, self.ocr_min_confidence + 0.02)
+        return conf_max >= max(0.65, self.ocr_min_confidence + 0.2)
 
     def _ensure_ocr_reader(self):
         if self.ocr_reader is not None:
             return self.ocr_reader
-        # EasyOCR carga un modelo; evitar hacerlo en cada frame
         import easyocr
-        # gpu=False: más seguro en Orin Nano si no queremos forzar CUDA
-        self.ocr_reader = easyocr.Reader(["es"], gpu=False)
-        return self.ocr_reader
 
-    def _ocr_job(self, frame, frame_count):
-        """OCR en background para no bloquear el loop principal."""
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        os.environ.setdefault("MKL_NUM_THREADS", "2")
+        with self.ocr_reader_lock:
+            if self.ocr_reader is not None:
+                return self.ocr_reader
+            langs_env = os.environ.get("OCR_LANGS", "es,en").strip()
+            langs = [x.strip() for x in langs_env.split(",") if x.strip()]
+            if not langs:
+                langs = ["es", "en"]
+            use_gpu = os.environ.get("OCR_GPU", "").strip().lower() in (
+                "1",
+                "yes",
+                "true",
+                "cuda",
+            )
+            print(f"🧾 OCR: iniciando EasyOCR (idiomas {langs}, gpu={use_gpu})...", flush=True)
+            self.ocr_reader = easyocr.Reader(langs, gpu=use_gpu)
+            print("🧾 OCR: EasyOCR Reader creado.", flush=True)
+            return self.ocr_reader
+
+    def _ocr_preprocess_variants(self, roi_bgr, fast=False):
+        """Escala + contraste (CLAHE). fast=True: una sola variante (mucho más rápido por voz)."""
+        h, w = roi_bgr.shape[:2]
+        min_dim = float(min(h, w))
+        try:
+            target = float(os.environ.get("OCR_MIN_SIDE", "520"))
+        except ValueError:
+            target = 520.0
+        if fast:
+            target = min(target, 420.0)
+        target = max(320.0, min(900.0, target))
+        scale = 1.0 if min_dim >= target else min(3.0, target / min_dim)
+        if scale > 1.02:
+            work = cv2.resize(roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        else:
+            work = roi_bgr.copy()
+        rgb_base = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
+        if fast:
+            return [rgb_base]
+        lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l_ch)
+        lab2 = cv2.merge([l2, a_ch, b_ch])
+        bgr_u = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+        rgb_clahe = cv2.cvtColor(bgr_u, cv2.COLOR_BGR2RGB)
+        return [rgb_base, rgb_clahe]
+
+    def _ocr_readtext_safe(self, reader, rgb, fast=False):
+        """readtext con parámetros pensados para texto pequeño; fallback si la API cambia."""
+        try:
+            if fast:
+                mag = float(os.environ.get("OCR_MAG_RATIO_FAST", "1.25"))
+                adj = float(os.environ.get("OCR_ADJUST_CONTRAST_FAST", "0.5"))
+                tthr = float(os.environ.get("OCR_TEXT_THR_FAST", "0.45"))
+                lowt = float(os.environ.get("OCR_LOW_TEXT_FAST", "0.28"))
+                lnk = float(os.environ.get("OCR_LINK_THR_FAST", "0.28"))
+            else:
+                mag = float(os.environ.get("OCR_MAG_RATIO", "2.0"))
+                adj = float(os.environ.get("OCR_ADJUST_CONTRAST", "0.7"))
+                tthr = float(os.environ.get("OCR_TEXT_THR", "0.52"))
+                lowt = float(os.environ.get("OCR_LOW_TEXT", "0.32"))
+                lnk = float(os.environ.get("OCR_LINK_THR", "0.32"))
+        except ValueError:
+            if fast:
+                mag, adj, tthr, lowt, lnk = 1.25, 0.5, 0.45, 0.28, 0.28
+            else:
+                mag, adj, tthr, lowt, lnk = 2.0, 0.7, 0.52, 0.32, 0.32
+        try:
+            return reader.readtext(
+                rgb,
+                detail=1,
+                paragraph=False,
+                mag_ratio=mag,
+                adjust_contrast=adj,
+                text_threshold=tthr,
+                low_text=lowt,
+                link_threshold=lnk,
+            )
+        except TypeError:
+            return reader.readtext(rgb, detail=1, paragraph=False, mag_ratio=max(1.2, mag))
+
+    @staticmethod
+    def _ocr_bbox_ycenter(bbox):
+        try:
+            a = np.asarray(bbox, dtype=float).reshape(-1, 2)
+            return float(np.mean(a[:, 1]))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _voice_wants_cartel_read(text):
+        """
+        Pedido de leer (cartel / texto). Incluye 'cartel' y también solo 'leer' en la frase,
+        porque Google STT suele cortar o no transcribir bien 'cartel'.
+        """
+        if not text or not str(text).strip():
+            return False
+        t = str(text).lower().strip()
+        compact = re.sub(r'[\s.,;:!?¿¡"\'-]+', "", t)
+        if "carteles" in compact or "cartel" in compact:
+            return True
+        if re.search(r"\bcarteles?\b", t):
+            return True
+        # Intención de lectura (lo que pediste: basta con "leer" en la frase)
+        if re.search(r"\bleer\b", t) or re.search(r"\bleyendo\b", t):
+            return True
+        if re.search(r"\bl[eé]eme\b", t) or re.search(r"\bleenos\b", t):
+            return True
+        if re.search(r"\blee\b", t):
+            return True
+        return False
+
+    def _ocr_speak_cartel(self, mensaje, from_voice_command):
+        """TTS del resultado OCR; no hablar si el watchdog canceló el pedido por voz."""
+        if from_voice_command and getattr(self, "_ocr_voice_cancelled", False):
+            print("🧾 OCR: resultado listo pero no se anuncia (tiempo agotado o cancelado).", flush=True)
+            return
+        self.speak_text_sync(mensaje)
+
+    def _ocr_job(self, frame, frame_count, from_voice_command=False, done_event=None):
+        """OCR en background. from_voice_command: pedido explícito por voz (no cortar por user_speaking)."""
+        started = False
+        voice_done = False
         try:
             now = time.time()
-            # No hablar/leer si estamos esperando al usuario
-            with self.user_speaking_lock:
-                if self.user_speaking:
-                    return
+            if not from_voice_command:
+                with self.user_speaking_lock:
+                    if self.user_speaking:
+                        return
 
-            roi = frame
+            roi = frame if frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(frame)
             h, w = roi.shape[:2]
-            # Recortar a zona central amplia: reduce ruido pero no pierde carteles
-            y1, y2 = int(h * 0.05), int(h * 0.95)
-            x1, x2 = int(w * 0.05), int(w * 0.95)
+            # 1080p + EasyOCR es muy lento; por voz usamos lado menor por defecto (más rápido).
+            env_ms = "OCR_VOICE_MAX_SIDE" if from_voice_command else "OCR_INPUT_MAX_SIDE"
+            default_ms = "800" if from_voice_command else "960"
+            try:
+                max_side = int(os.environ.get(env_ms, default_ms))
+            except ValueError:
+                max_side = int(default_ms)
+            max_side = max(480, min(1920, max_side))
+            if max(h, w) > max_side:
+                scale = max_side / float(max(h, w))
+                roi = cv2.resize(
+                    roi,
+                    (int(w * scale), int(h * scale)),
+                    interpolation=cv2.INTER_AREA,
+                )
+                h, w = roi.shape[:2]
+            # Cartel suele estar en el centro; recorte un poco más ajustado opcional
+            ym, xm = float(os.environ.get("OCR_CROP_YMARGIN", "0.04")), float(
+                os.environ.get("OCR_CROP_XMARGIN", "0.04")
+            )
+            ym = max(0.0, min(0.2, ym))
+            xm = max(0.0, min(0.2, xm))
+            y1, y2 = int(h * ym), int(h * (1.0 - ym))
+            x1, x2 = int(w * xm), int(w * (1.0 - xm))
             roi = roi[y1:y2, x1:x2]
             if roi.size == 0:
                 return
 
-            # Asegurar tamaño mínimo para OCR
-            min_dim = min(roi.shape[:2])
-            if min_dim < 250:
-                scale = 2.0
-                roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            started = True
+            t_ocr0 = time.time()
+            print(
+                "🧾 OCR: analizando imagen (la primera vez puede tardar al cargar el modelo)...",
+                flush=True,
+            )
 
             reader = self._ensure_ocr_reader()
-            rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            print("🧾 OCR: escaneando texto en la imagen...", flush=True)
+            # Por voz: una variante + readtext más liviano (evita cuelgue larguísimo en CPU).
+            ocr_fast = bool(from_voice_command)
+            if from_voice_command and os.environ.get("OCR_VOICE_FULL", "").strip().lower() in (
+                "1",
+                "yes",
+                "true",
+            ):
+                ocr_fast = False
+            all_detections = []
+            for rgb in self._ocr_preprocess_variants(roi, fast=ocr_fast):
+                chunk = self._ocr_readtext_safe(reader, rgb, fast=ocr_fast)
+                if chunk:
+                    all_detections.extend(chunk)
 
-            results = reader.readtext(rgb, detail=1, paragraph=False)
-            if not results:
+            if not all_detections:
                 return
 
+            # Unificar líneas repetidas entre variantes (quedarse con mayor confianza)
+            by_key = {}
+            for bbox, text, conf in all_detections:
+                t = self._ocr_normalize(text)
+                if not t:
+                    continue
+                cf = float(conf) if conf is not None else 0.0
+                key = re.sub(r"\s+", " ", t.lower())
+                if key not in by_key or cf > by_key[key][2]:
+                    by_key[key] = (bbox, t, cf)
+
+            results = list(by_key.values())
+            results.sort(key=lambda r: self._ocr_bbox_ycenter(r[0]))
+
             raw_texts = []
-            for _, text_raw, conf_raw in results[:5]:
+            for _, text_raw, conf_raw in sorted(
+                results, key=lambda x: -x[2]
+            )[:8]:
                 tn = self._ocr_normalize(text_raw)
                 if tn:
                     raw_texts.append((tn, float(conf_raw) if conf_raw is not None else 0.0))
@@ -1240,6 +1774,11 @@ class OAKDObjectDetector:
 
             candidates = []
             conf_max = 0.0
+            min_conf_ocr = (
+                max(0.15, self.ocr_min_confidence - 0.1)
+                if from_voice_command
+                else self.ocr_min_confidence
+            )
             for bbox, text, conf in results:
                 t = self._ocr_normalize(text)
                 if not t:
@@ -1248,11 +1787,11 @@ class OAKDObjectDetector:
                     continue
                 conf_f = float(conf)
                 conf_max = max(conf_max, conf_f)
-                if conf_f < self.ocr_min_confidence:
+                if conf_f < min_conf_ocr:
                     continue
-                if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", t, flags=re.IGNORECASE):
+                if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]", t, flags=re.IGNORECASE):
                     continue
-                if len(t) < 3:
+                if len(t) < 2:
                     continue
                 candidates.append((bbox, t, conf_f))
 
@@ -1264,11 +1803,13 @@ class OAKDObjectDetector:
                 for tn, _conf in raw_texts:
                     for w_ in tn.split():
                         w_ = w_.strip()
-                        if len(w_) < 3:
+                        if len(w_) < 2:
                             continue
-                        if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", w_, flags=re.IGNORECASE):
+                        if not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]", w_, flags=re.IGNORECASE):
                             continue
-                        if not re.search(r"[aeiouáéíóú]", w_, flags=re.IGNORECASE):
+                        if len(w_) >= 3 and not re.search(
+                            r"[aeiouáéíóú0-9]", w_, flags=re.IGNORECASE
+                        ):
                             continue
                         fallback_words.append(w_)
                         if len(fallback_words) >= self.ocr_max_words:
@@ -1282,18 +1823,21 @@ class OAKDObjectDetector:
                 texto = " ".join(fallback_words)[: self.ocr_max_chars].strip()
                 texto_key = re.sub(r"[^a-zA-Z0-9ÁÉÍÓÚÑáéíóúñ ]+", "", texto).lower()
                 texto_key = re.sub(r"\s+", " ", texto_key).strip()
-                if texto_key == self.ocr_last_text_key:
+                if texto_key == self.ocr_last_text_key and not from_voice_command:
                     return
+                if texto_key == self.ocr_last_text_key and from_voice_command:
+                    print(f"\n🪧 CARTEL (mismo texto, pediste otra vez): {texto}\n")
 
                 mensaje = f"Hay un cartel que dice: {texto}"
                 print(f"\n🪧 CARTEL LEÍDO (OCR, best effort): {texto}\n")
                 self.ocr_last_text_key = texto_key
                 self.ocr_last_announce_time = now
-                self.speak_text_sync(mensaje)
+                self._ocr_speak_cartel(mensaje, from_voice_command)
+                voice_done = True
                 return
 
-            candidates_top = sorted(candidates, key=lambda x: x[2], reverse=True)[:6]
-            candidates_top.sort(key=lambda x: (x[0][0][1] + x[0][2][1]) / 2.0)
+            candidates_top = sorted(candidates, key=lambda x: x[2], reverse=True)[:8]
+            candidates_top.sort(key=lambda x: self._ocr_bbox_ycenter(x[0]))
 
             words = []
             for _, t, _ in candidates_top:
@@ -1317,10 +1861,14 @@ class OAKDObjectDetector:
             texto_key = re.sub(r"[^a-zA-Z0-9ÁÉÍÓÚÑáéíóúñ ]+", "", texto).lower()
             texto_key = re.sub(r"\s+", " ", texto_key).strip()
 
-            if not self._ocr_spanish_like(texto, conf_max):
+            if not self._ocr_spanish_like(
+                texto, conf_max, for_voice_command=from_voice_command
+            ):
                 return
-            if texto_key == self.ocr_last_text_key:
+            if texto_key == self.ocr_last_text_key and not from_voice_command:
                 return
+            if texto_key == self.ocr_last_text_key and from_voice_command:
+                print(f"\n🪧 CARTEL (mismo texto, pediste otra vez): {texto}\n")
 
             mensaje = f"Hay un cartel que dice: {texto}"
             print(f"\n🪧 CARTEL LEÍDO (OCR): {texto}\n")
@@ -1330,12 +1878,37 @@ class OAKDObjectDetector:
             self.ocr_last_announce_time = now
 
             # Hablar sin bloquear el loop principal (estamos en thread)
-            self.speak_text_sync(mensaje)
+            self._ocr_speak_cartel(mensaje, from_voice_command)
+            voice_done = True
         except Exception as e:
             print(f"🧾 OCR error: {e}")
         finally:
+            try:
+                if started:
+                    print(
+                        f"🧾 OCR: fin análisis en {time.time() - t_ocr0:.1f}s",
+                        flush=True,
+                    )
+            except Exception:
+                pass
             with self.ocr_thread_lock:
                 self.ocr_in_progress = False
+            if done_event is not None:
+                done_event.set()
+            if (
+                from_voice_command
+                and started
+                and not voice_done
+                and not getattr(self, "_ocr_voice_cancelled", False)
+            ):
+                try:
+                    self.speak_text_sync(
+                        "No pude leer texto claro en el cartel. "
+                        "Acercalo al centro de la imagen, con buena luz, y decí leer otra vez."
+                    )
+                except Exception:
+                    pass
+                print("🧾 OCR: sin texto aceptable (fin del análisis).", flush=True)
 
     def try_auto_read_cartel(self, frame, frame_count):
         """
@@ -1361,7 +1934,11 @@ class OAKDObjectDetector:
                 self.ocr_in_progress = True
 
             frame_copy = frame.copy()
-            threading.Thread(target=self._ocr_job, args=(frame_copy, frame_count), daemon=True).start()
+            threading.Thread(
+                target=self._ocr_job,
+                args=(frame_copy, frame_count, False),
+                daemon=True,
+            ).start()
         except Exception:
             return
     
@@ -1478,6 +2055,41 @@ class OAKDObjectDetector:
                         print(f"Error escuchando: {e}")
                 time.sleep(0.1)
     
+    def grab_fresh_rgb_for_ocr(self):
+        """
+        Mientras listen_once() corre, el bucle principal no consume las colas OAK:
+        se acumulan frames; al pedir leer, vaciamos y tomamos un par rgb+depth nuevo
+        para que la imagen sea la de cuando terminaste de hablar (cartel alineado a la cámara).
+        """
+        try:
+            rq = getattr(self, "q_rgb", None)
+            dq = getattr(self, "q_depth", None)
+            if rq is None or dq is None:
+                return None
+            n = 0
+            while rq.has():
+                rq.tryGet()
+                n += 1
+            while dq.has():
+                dq.tryGet()
+                n += 1
+            if n:
+                print(f"🧾 OCR: descartados {n} frames en cola (acumulados mientras escuchabas).", flush=True)
+            t0 = time.time()
+            while time.time() - t0 < 1.5:
+                if rq.has() and dq.has():
+                    in_rgb = rq.tryGet()
+                    in_depth = dq.tryGet()
+                    if in_rgb is not None and in_depth is not None:
+                        bgr = in_rgb.getCvFrame()
+                        return np.ascontiguousarray(bgr.copy())
+                time.sleep(0.002)
+            print("🧾 OCR: no llegó par rgb+depth fresco a tiempo.", flush=True)
+            return None
+        except Exception as e:
+            print(f"🧾 grab_fresh_rgb_for_ocr: {e}", flush=True)
+            return None
+
     def listen_once(self, timeout_seconds=6):
         """Escucha una sola frase (para cuando pregunta '¿Deseas preguntar algo?'). Devuelve texto o None."""
         if self.microphone is None or self.recognizer is None:
@@ -1489,7 +2101,11 @@ class OAKDObjectDetector:
                 sys.stderr = devnull
                 try:
                     with self.microphone as source:
-                        audio = self.recognizer.listen(source, timeout=timeout_seconds, phrase_time_limit=5)
+                        audio = self.recognizer.listen(
+                            source,
+                            timeout=timeout_seconds,
+                            phrase_time_limit=min(10, timeout_seconds + 2),
+                        )
                     text = self.recognizer.recognize_google(audio, language='es-ES')
                     return text.strip().lower() if text else None
                 except sr.WaitTimeoutError:
@@ -1503,52 +2119,49 @@ class OAKDObjectDetector:
         except Exception:
             return None
     
-    def process_voice_command(self, command):
-        """Procesa un comando de voz y responde"""
-        # El usuario está hablando, mantener bandera activa durante el procesamiento
+    def process_voice_command(self, command, after_listen_prompt=False):
+        """
+        Procesa un comando de voz y responde.
+        after_listen_prompt: True si acaba de sonar '¿Deseas preguntar algo?' (permite
+        entender 'estoy' o 'dónde' cuando Google solo transcribe parte de la frase).
+        """
         command_lower = command.lower()
         
-        # Comando para apagar el programa - PATRONES MÁS FLEXIBLES
+        # Apagar: solo palabras/frases completas (\b) para no confundir con "cartel", "para leer", etc.
         apagar_patterns = [
-            r'apagar',
-            r'apaga',
-            r'apagalo',
-            r'apagalo',
-            r'apagá',
-            r'apagálo',
-            r'cerrar',
-            r'cierra',
-            r'cerralo',
-            r'cerrá',
-            r'cerrálo',
-            r'salir',
-            r'sale',
-            r'salilo',
-            r'detener',
-            r'detén',
-            r'detenlo',
-            r'detenélo',
-            r'parar',
-            r'para',
-            r'paralo',
-            r'pará',
-            r'parálo',
-            r'terminar',
-            r'termina',
-            r'terminarlo',
-            r'terminá',
-            r'terminálo',
-            r'apaga sistema',
-            r'apagar sistema',
-            r'cierra sistema',
-            r'cerrar sistema'
+            r"\bapagar\b",
+            r"\bapaga\b",
+            r"\bapagalo\b",
+            r"\bapagá\b",
+            r"\bapagálo\b",
+            r"\bcerrar\b",
+            r"\bcierra\b",
+            r"\bcerralo\b",
+            r"\bcerrá\b",
+            r"\bcerrálo\b",
+            r"\bsalir\b",
+            r"\bsalilo\b",
+            r"\bdetener\b",
+            r"\bdetén\b",
+            r"\bdetenlo\b",
+            r"\bdetenélo\b",
+            # No \bparar\b ("sin parar"); sí imperativos claros:
+            r"\bparalo\b",
+            r"\bpará\b",
+            r"\bparálo\b",
+            # No \btermina\b ("donde termina el cartel"); sí "terminar":
+            r"\bterminar\b",
+            r"\bterminarlo\b",
+            r"\bterminá\b",
+            r"\bterminálo\b",
+            r"\bapagar\s+el\s+sistema\b",
+            r"\bapaga\s+el\s+sistema\b",
+            r"\bcierra\s+el\s+sistema\b",
+            r"\bcerrar\s+el\s+sistema\b",
         ]
-        
-        # Verificar si es comando de apagado - BÚSQUEDA MÁS FLEXIBLE
-        command_words = command_lower.split()
+
         for pattern in apagar_patterns:
-            # Buscar patrón completo o como palabra individual
-            if re.search(pattern, command_lower) or any(re.search(pattern, word) for word in command_words):
+            if re.search(pattern, command_lower):
                 print(f"🎤 ✓✓✓ COMANDO DE APAGADO DETECTADO: '{command}' (patrón: {pattern})")
                 respuesta = "Apagando el sistema. Hasta luego."
                 print(f"📢 Respuesta: {respuesta}")
@@ -1577,33 +2190,89 @@ class OAKDObjectDetector:
                 self.running = False
                 return True
 
-        # OCR bajo demanda: si el usuario dice "cartel", leer el texto del último frame
-        if re.search(r"\bcartel\b", command_lower):
-            # Aviso inmediato para que el usuario entienda que ahora está leyendo
-            try:
-                self.speak_text_sync("Estoy leyendo el cartel.")
-            except:
-                pass
-            # Pequeña espera: ayuda a que el frame del cartel sea más estable
-            time.sleep(1.0)
-            if self.last_frame_for_ocr is None:
-                respuesta = "No puedo ver un cartel ahora mismo."
+        # OCR bajo demanda: "cartel", "puedes leer", "léeme", etc.
+        if self._voice_wants_cartel_read(command_lower):
+            with self.ocr_thread_lock:
+                if self.ocr_in_progress:
+                    self.speak_text_sync("Esperá, sigo leyendo el cartel anterior.")
+                    with self.user_speaking_lock:
+                        self.user_speaking = False
+                    return False
+                self.ocr_in_progress = True
+
+            # Imagen FRESCA: mientras escuchabas no se leían las colas; last_frame sería viejo.
+            frame_copy = self.grab_fresh_rgb_for_ocr()
+            if frame_copy is None and self.last_frame_for_ocr is not None:
+                try:
+                    frame_copy = np.ascontiguousarray(self.last_frame_for_ocr.copy())
+                    print("🧾 OCR: usando respaldo (último frame del bucle principal).", flush=True)
+                except Exception as e:
+                    print(f"🧾 OCR: no se pudo copiar respaldo: {e}")
+                    frame_copy = None
+            if frame_copy is None:
+                respuesta = "No puedo obtener imagen de la cámara ahora mismo."
                 print(f"📢 Respuesta: {respuesta}")
                 self.speak_text(respuesta, force=True)
+                with self.ocr_thread_lock:
+                    self.ocr_in_progress = False
                 with self.user_speaking_lock:
                     self.user_speaking = False
                 return False
 
+            fc = int(self.last_frame_count_for_ocr)
+
             try:
-                # Evitar que OCR se ejecute a la vez (por si acaso)
-                with self.ocr_thread_lock:
-                    if self.ocr_in_progress:
-                        return False
-                    self.ocr_in_progress = True
-                self._ocr_job(self.last_frame_for_ocr, self.last_frame_count_for_ocr)
-            finally:
+                self.speak_text_sync("Estoy leyendo el cartel.")
+            except Exception:
+                pass
+
+            self._ocr_voice_cancelled = False
+            ocr_done_evt = threading.Event()
+
+            def _ocr_voice_worker():
+                try:
+                    self._ocr_job(
+                        frame_copy,
+                        fc,
+                        from_voice_command=True,
+                        done_event=ocr_done_evt,
+                    )
+                except Exception as ex:
+                    print(f"🧾 OCR error (voz): {ex}")
+                    import traceback
+
+                    traceback.print_exc()
+                finally:
+                    ocr_done_evt.set()
+
+            threading.Thread(target=_ocr_voice_worker, daemon=True).start()
+
+            def _ocr_voice_watchdog():
+                try:
+                    sec = float(os.environ.get("OCR_VOICE_TIMEOUT_SEC", "60"))
+                except ValueError:
+                    sec = 60.0
+                sec = max(25.0, min(240.0, sec))
+                time.sleep(sec)
+                if ocr_done_evt.is_set():
+                    return
+                self._ocr_voice_cancelled = True
+                print(
+                    f"🧾 OCR: sin terminar en {sec:.0f}s — se desbloquea el programa. "
+                    "(EasyOCR puede seguir en segundo plano; mirá si apareció 'precarga lista'.)",
+                    flush=True,
+                )
                 with self.ocr_thread_lock:
                     self.ocr_in_progress = False
+                try:
+                    self.speak_text_sync(
+                        "Tardó demasiado leer el cartel. "
+                        "Esperá a que termine de cargar el reconocedor y decí leer otra vez."
+                    )
+                except Exception:
+                    pass
+
+            threading.Thread(target=_ocr_voice_watchdog, daemon=True).start()
 
             with self.user_speaking_lock:
                 self.user_speaking = False
@@ -1611,33 +2280,62 @@ class OAKDObjectDetector:
         
         # Comandos GPS
         gps_patterns = [
-            r'dónde estoy',
-            r'donde estoy',
-            r'cuál es mi ubicación',
-            r'cual es mi ubicacion',
-            r'qué es mi ubicación',
-            r'que es mi ubicacion',
-            r'dime dónde estoy',
-            r'dime donde estoy',
-            r'ubicación',
-            r'ubicacion',
-            r'coordenadas',
-            r'posición',
-            r'posicion',
-            r'gps'
+            r"dónde estoy",
+            r"donde estoy",
+            r"cuál es mi ubicación",
+            r"cual es mi ubicacion",
+            r"qué es mi ubicación",
+            r"que es mi ubicacion",
+            r"dime dónde estoy",
+            r"dime donde estoy",
+            r"ubicación",
+            r"ubicacion",
+            r"coordenadas",
+            r"posición",
+            r"posicion",
+            r"\bgps\b",
+            r"localización",
+            r"localizacion",
+            r"en qué lugar",
+            r"en que lugar",
         ]
-        
-        # Verificar si es una pregunta GPS
-        for pattern in gps_patterns:
-            if re.search(pattern, command_lower):
-                location_text = self.get_location_text()
-                print(f"🎤 Pregunta GPS: {command}")
-                print(f"📍 Respuesta: {location_text}")
-                self.speak_text(location_text, force=True)  # Forzar para responder al usuario
-                # Desactivar bandera después de responder
-                with self.user_speaking_lock:
-                    self.user_speaking = False
-                return True
+
+        def _es_consulta_gps(text):
+            if not text or not str(text).strip():
+                return False
+            t = re.sub(r"\s+", " ", str(text).lower().strip())
+            for pattern in gps_patterns:
+                if re.search(pattern, t):
+                    return True
+            if after_listen_prompt:
+                # Reconocedor a veces corta "dónde estoy" → solo "estoy" / "donde"
+                if t in (
+                    "estoy",
+                    "donde",
+                    "dónde",
+                    "ubicame",
+                    "ubícame",
+                    "localizame",
+                    "localízame",
+                ):
+                    return True
+                if t.startswith("donde ") or t.startswith("dónde "):
+                    return True
+            return False
+
+        if _es_consulta_gps(command_lower):
+            voz_txt, extra_consola = self.get_location_text()
+            print(f"📍 GPS ({command.strip()}): {voz_txt}")
+            if extra_consola:
+                print(extra_consola)
+            if not self.gps_serial:
+                print(
+                    "  ℹ Huawei y GPS suelen ser ttyUSB distintos: lsusb + ls -la /dev/ttyUSB*"
+                )
+            self.speak_text(voz_txt, force=True)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return True
         
         # Traducciones de objetos al inglés (para buscar en YOLO)
         traducciones_inv = {
@@ -1809,7 +2507,11 @@ class OAKDObjectDetector:
                 # Sin pyttsx3 (modo SSH/embebido): usar espeak, no aborta
                 if self.tts_engine is None:
                     with self.tts_lock:
-                        subprocess.run(["espeak", "-v", "es", text], capture_output=True, timeout=15)
+                        subprocess.run(
+                            ["espeak", "-v", "es", "-s", "160", text],
+                            capture_output=True,
+                            timeout=45,
+                        )
                     return
                 # Si no es forzado, verificar si el usuario está hablando
                 if not force:
@@ -1856,7 +2558,11 @@ class OAKDObjectDetector:
             import subprocess
             if self.tts_engine is None:
                 with self.tts_lock:
-                    subprocess.run(["espeak", "-v", "es", text], capture_output=True, timeout=30)
+                    subprocess.run(
+                        ["espeak", "-v", "es", "-s", "160", text],
+                        capture_output=True,
+                        timeout=45,
+                    )
             else:
                 with self.tts_lock:
                     self.tts_engine.say(text)
@@ -1873,6 +2579,8 @@ class OAKDObjectDetector:
         print("🔊 Audio: Resumen por voz cada 10 s (espeak). Conecta auricular/speaker en la Jetson.")
         print("   - Objetos y distancias, obstáculos próximos, desniveles en el suelo")
         print("🎤 Micrófono: Comandos por voz (si está conectado)")
+        print("🌐 Si te alejás del WiFi, SSH puede cortarse: usá tmux/screen o datos en la Jetson (modem USB).")
+        print("📍 GPS + modem: export GPS_SERIAL_PORT=/dev/ttyUSB1 — identificar con lsusb y ls /dev/ttyUSB*")
         print("⌨️  PARA SALIR: Ctrl+C en esta terminal, o di 'terminar'/'apagar' cuando pregunte '¿Deseas preguntar algo?'")
         print("   Cada 4 ciclos de lo que ve, te preguntará si quieres preguntar algo y ahí podrás hablar.\n")
         print("="*60 + "\n")
@@ -1918,11 +2626,16 @@ class OAKDObjectDetector:
                 if not self.running:
                     break
                 
-                # Obtener frames (sin bloqueo)
+                # Par rgb+depth más reciente: vaciar la cola evita YOLO sobre frames viejos.
                 try:
-                    in_rgb = self.q_rgb.tryGet()
-                    in_depth = self.q_depth.tryGet()
-                    
+                    in_rgb, in_depth = None, None
+                    while self.q_rgb.has() and self.q_depth.has():
+                        r = self.q_rgb.tryGet()
+                        d = self.q_depth.tryGet()
+                        if r is not None and d is not None:
+                            in_rgb, in_depth = r, d
+                        else:
+                            break
                     if in_rgb is None or in_depth is None:
                         continue
                 except Exception as e:
@@ -1932,7 +2645,8 @@ class OAKDObjectDetector:
                 
                 frame = in_rgb.getCvFrame()
                 depth_frame = in_depth.getFrame()
-                # Guardar último frame para OCR bajo demanda (cuando el usuario diga "cartel")
+                # Referencia al último frame (sin copia por vuelta: 1080p a 30 fps mataba el FPS).
+                # OCR por voz usa grab_fresh_rgb_for_ocr() tras escuchar + copia ahí.
                 self.last_frame_for_ocr = frame
                 self.last_frame_count_for_ocr = frame_count
                 
@@ -2013,13 +2727,15 @@ class OAKDObjectDetector:
                             print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
                             with self.user_speaking_lock:
                                 self.user_speaking = True
-                            user_text = self.listen_once(timeout_seconds=6)
+                            user_text = self.listen_once(timeout_seconds=8)
                             with self.user_speaking_lock:
                                 self.user_speaking = False
                             self.last_listen_end_time = time.time()
                             if user_text:
                                 print(f"\n🎤 Dijiste: {user_text}\n")
-                                self.process_voice_command(user_text)
+                                self.process_voice_command(
+                                    user_text, after_listen_prompt=True
+                                )
                                 if not self.running:
                                     break
                         else:
@@ -2035,7 +2751,8 @@ class OAKDObjectDetector:
                                 ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
                         except:
                             ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
-                        if ocr_in_prog or (time.time() - getattr(self, "ocr_last_announce_time", 0.0)) < 15.0:
+                        # Solo mientras el hilo OCR está activo (evita repetir "leyendo" 15 s sin proceso)
+                        if ocr_in_prog:
                             resumen = "Estoy leyendo un cartel."
                         else:
                             resumen = "No estoy viendo ningún objeto en este momento. No hay obstáculos próximos"
@@ -2047,13 +2764,15 @@ class OAKDObjectDetector:
                             print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
                             with self.user_speaking_lock:
                                 self.user_speaking = True
-                            user_text = self.listen_once(timeout_seconds=6)
+                            user_text = self.listen_once(timeout_seconds=8)
                             with self.user_speaking_lock:
                                 self.user_speaking = False
                             self.last_listen_end_time = time.time()
                             if user_text:
                                 print(f"\n🎤 Dijiste: {user_text}\n")
-                                self.process_voice_command(user_text)
+                                self.process_voice_command(
+                                    user_text, after_listen_prompt=True
+                                )
                                 if not self.running:
                                     break
                         else:
