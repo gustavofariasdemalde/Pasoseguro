@@ -18,12 +18,14 @@ import threading
 import speech_recognition as sr
 import queue
 import re
+import json
 import os
 import sys
 import signal
 import serial
 import serial.tools.list_ports
 from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
 
 # Suprimir mensajes de ALSA (audio) desde el inicio usando variables de entorno
 if sys.platform == 'linux':
@@ -218,6 +220,8 @@ class OAKDObjectDetector:
         self.gps_thread = None
         self.gps_probe_baud = None  # baud detectado al sondear NMEA (find_gps_port)
         self._gps_last_lazy_attempt = 0.0  # throttle para reintento al pedir ubicación
+        self._gps_last_console_log = 0.0
+        self._gps_last_logged_latlon = None
         
         # Inicializar geocodificador para obtener direcciones
         try:
@@ -226,6 +230,15 @@ class OAKDObjectDetector:
         except Exception as e:
             print(f"  ⚠ Error inicializando geocodificador: {e}")
             self.geolocator = None
+
+        # Guía simple a destino (geocodificar + distancia / orientación por voz)
+        self.nav_destination = None
+        self.nav_lock = threading.Lock()
+        self.home_location = self._load_home_location()
+        print(
+            f"  ✓ Casa guardada: {self.home_location['label']} "
+            f"({self.home_location['latitude']:.6f}, {self.home_location['longitude']:.6f})"
+        )
         
         try:
             # Intentar activar GPS automáticamente si no se encuentra
@@ -631,15 +644,81 @@ class OAKDObjectDetector:
                 if coords is None:
                     return None
                 latitude, longitude = coords
-                return {
+                fix = {
                     "latitude": latitude,
                     "longitude": longitude,
                     "quality": 1,
                     "timestamp": time.time(),
                 }
+                if len(parts) > 8 and parts[8]:
+                    try:
+                        fix["course_deg"] = float(parts[8]) % 360.0
+                    except ValueError:
+                        pass
+                return fix
         except Exception:
             pass
         return None
+
+    def _merge_gps_fix(self, location):
+        """Combina fixes GGA/RMC sin perder el rumbo (RMC) al actualizar posición."""
+        with self.gps_lock:
+            prev = dict(self.gps_location) if self.gps_location else {}
+            merged = {**prev, **location}
+            if "course_deg" not in location and prev.get("course_deg") is not None:
+                merged["course_deg"] = prev["course_deg"]
+            self.gps_location = merged
+
+    def _log_gps_fix_console(self, snap):
+        extra = ""
+        if snap.get("course_deg") is not None:
+            extra = f", rumbo {snap['course_deg']:.0f}°"
+        print(
+            f"📍 GPS: Lat {snap['latitude']:.6f}, Lon {snap['longitude']:.6f} "
+            f"(calidad: {snap['quality']}){extra}",
+            flush=True,
+        )
+
+    def _maybe_log_gps_fix(self, snap):
+        """
+        El GPS sigue leyendo en memoria siempre; solo limita mensajes en consola.
+        GPS_VERBOSE=1 → cada trama. Por defecto: 1.ª vez y luego cada ~30 s o si te movés ~15 m.
+        """
+        verbose = os.environ.get("GPS_VERBOSE", "").strip().lower() in (
+            "1",
+            "yes",
+            "true",
+        )
+        if verbose:
+            self._log_gps_fix_console(snap)
+            return
+
+        now = time.time()
+        if self._gps_last_logged_latlon is None:
+            self._log_gps_fix_console(snap)
+            self._gps_last_console_log = now
+            self._gps_last_logged_latlon = (snap["latitude"], snap["longitude"])
+            return
+
+        try:
+            interval = float(os.environ.get("GPS_LOG_INTERVAL_SEC", "30"))
+        except ValueError:
+            interval = 30.0
+        interval = max(10.0, min(300.0, interval))
+
+        moved_m = 0.0
+        try:
+            moved_m = geodesic(
+                self._gps_last_logged_latlon,
+                (snap["latitude"], snap["longitude"]),
+            ).meters
+        except Exception:
+            pass
+
+        if moved_m >= 15.0 or (now - self._gps_last_console_log) >= interval:
+            self._log_gps_fix_console(snap)
+            self._gps_last_console_log = now
+            self._gps_last_logged_latlon = (snap["latitude"], snap["longitude"])
     
     def read_gps_data(self):
         """Lee datos GPS en un thread separado"""
@@ -676,13 +755,10 @@ class OAKDObjectDetector:
                                 )
                             location = self.parse_nmea(line)
                             if location:
+                                self._merge_gps_fix(location)
                                 with self.gps_lock:
-                                    self.gps_location = location
-                                    print(
-                                        f"📍 GPS: Lat {location['latitude']:.6f}, Lon {location['longitude']:.6f} "
-                                        f"(calidad: {location['quality']})",
-                                        flush=True,
-                                    )
+                                    snap = dict(self.gps_location)
+                                self._maybe_log_gps_fix(snap)
                             elif time.time() - last_status_print > 30:
                                 print(
                                     "📡 GPS: tramas sin posición fija todavía (cielo abierto ayuda)",
@@ -808,6 +884,475 @@ class OAKDObjectDetector:
             f"{lon_abs:.3f} grados {lon_dir}."
         )
         return (voz, None)
+
+    def _nav_clean_address(self, raw):
+        """Quita muletillas al final de la frase de destino."""
+        t = re.sub(r"\s+", " ", (raw or "").strip())
+        tail = (
+            r"(?:\s+)?(?:por favor|gracias|guiame|guíame|guia|guía|"
+            r"navega|navegar|llevame|llévame|ayudame|ayúdame|"
+            r"me puedes guiar|puedes guiarme|pod[eé]s guiarme)$"
+        )
+        while True:
+            n = re.sub(tail, "", t, flags=re.IGNORECASE).strip(" ,.")
+            if n == t:
+                break
+            t = n
+        return t.strip(" ,.")
+
+    def _extract_nav_destination(self, command_lower):
+        """Extrae calle/lugar de frases tipo 'quiero ir a … guíame'."""
+        t = re.sub(r"\s+", " ", (command_lower or "").strip())
+        patterns = [
+            r"quiero ir a (.+)",
+            r"quiero llegar a (.+)",
+            r"me llevas a (.+)",
+            r"llevame a (.+)",
+            r"llévame a (.+)",
+            r"gu[ií]ame a (.+)",
+            r"gu[ií]a(?:me)? a (.+)",
+            r"navega(?:r)? a (.+)",
+            r"ir hasta (.+)",
+            r"destino (.+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, t)
+            if m:
+                dest = self._nav_clean_address(m.group(1))
+                if len(dest) >= 4:
+                    return dest
+        return None
+
+    def _format_distancia_voz(self, meters):
+        """Distancia en español para espeak (objetos, GPS, guía)."""
+        if meters is None or meters < 0:
+            return None
+        if meters < 1.0:
+            return f"{max(1, int(round(meters * 100)))} centímetros"
+        if meters < 10.0:
+            d = round(meters, 1)
+            if abs(d - round(d)) < 0.05:
+                return f"{int(round(d))} metros"
+            return f"{d:.1f} metros"
+        if meters < 1000:
+            return f"{int(round(meters))} metros"
+        km = meters / 1000.0
+        if km < 10:
+            return f"{km:.1f} kilómetros"
+        return f"{int(round(km))} kilómetros"
+
+    def _nav_distance_text(self, meters):
+        t = self._format_distancia_voz(meters)
+        return t if t else "0 metros"
+
+    def _nombre_objeto_es(self, nombre_en):
+        traducciones = {
+            "chair": "silla",
+            "person": "persona",
+            "car": "auto",
+            "bicycle": "bicicleta",
+            "dining table": "mesa",
+            "couch": "sofá",
+            "bed": "cama",
+            "tv": "televisor",
+            "laptop": "computadora",
+            "cell phone": "teléfono",
+            "bottle": "botella",
+            "cup": "taza",
+            "book": "libro",
+            "clock": "reloj",
+            "cat": "gato",
+            "dog": "perro",
+            "bench": "banco",
+            "potted plant": "planta",
+            "backpack": "mochila",
+            "handbag": "cartera",
+        }
+        return traducciones.get(nombre_en, str(nombre_en).replace("_", " "))
+
+    def _respuesta_objeto_detectado(self, nombre_en, distancia):
+        """Respuesta por voz centrada en la distancia (útil para sentarse, esquivar, etc.)."""
+        nombre_es = self._nombre_objeto_es(nombre_en)
+        dist_txt = self._format_distancia_voz(distancia)
+        if not dist_txt:
+            return f"Veo {nombre_es}, pero no pude medir la distancia."
+        return f"{nombre_es.capitalize()} está a {dist_txt}."
+
+    def _buscar_objeto_actual(self, objeto_en):
+        """Devuelve (nombre_en, info) del objeto pedido, el más cercano si hay varios."""
+        if not objeto_en:
+            return None
+        key = str(objeto_en).lower().strip()
+        with self.objects_lock:
+            items = list(self.current_objects.items())
+        best = None
+        best_d = float("inf")
+        for name, info in items:
+            nl = name.lower()
+            if key == nl or key in nl or nl in key:
+                d = float(info.get("distancia", 9999))
+                if d < best_d:
+                    best_d = d
+                    best = (name, info)
+        return best
+
+    def _bearing_deg(self, lat1, lon1, lat2, lon2):
+        import math
+
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dlam = math.radians(lon2 - lon1)
+        x = math.sin(dlam) * math.cos(phi2)
+        y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+        return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+    def _bearing_cardinal_es(self, bearing):
+        dirs = (
+            "norte",
+            "noreste",
+            "este",
+            "sureste",
+            "sur",
+            "suroeste",
+            "oeste",
+            "noroeste",
+        )
+        return dirs[int((bearing + 22.5) / 45.0) % 8]
+
+    def _nav_turn_hint(self, bearing_to_dest, course_deg):
+        if course_deg is None:
+            return None
+        diff = (bearing_to_dest - course_deg + 540.0) % 360.0 - 180.0
+        if abs(diff) <= 35.0:
+            return "adelante"
+        if diff > 35.0:
+            return "a tu derecha"
+        return "a tu izquierda"
+
+    def _home_gps_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mi_casa_gps.json")
+
+    def _load_home_location(self):
+        """Carga coordenadas de casa (archivo mi_casa_gps.json o variables HOME_LAT/LON)."""
+        default = {
+            "latitude": -31.260652,
+            "longitude": -61.475046,
+            "label": "casa",
+        }
+        path = self._home_gps_path()
+        data = dict(default)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except Exception as e:
+                print(f"  ⚠ No se pudo leer {path}: {e}")
+        else:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(default, f, indent=2, ensure_ascii=False)
+                print(f"  ✓ Creado {path} con las coordenadas de tu casa")
+            except Exception as e:
+                print(f"  ⚠ No se pudo crear {path}: {e}")
+
+        try:
+            data["latitude"] = float(os.environ.get("HOME_LAT", data["latitude"]))
+            data["longitude"] = float(os.environ.get("HOME_LON", data["longitude"]))
+        except ValueError:
+            pass
+        data["label"] = os.environ.get("HOME_LABEL", data.get("label", "casa"))
+        return data
+
+    def clear_nav_destination(self):
+        with self.nav_lock:
+            self.nav_destination = None
+
+    def set_nav_destination_coords(self, lat, lon, label="casa"):
+        """Fija destino por coordenadas (casa guardada, sin internet)."""
+        dest = {
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "label": label,
+            "query": f"coords:{lat:.6f},{lon:.6f}",
+            "set_at": time.time(),
+            "is_home": str(label).lower() == "casa",
+        }
+        with self.nav_lock:
+            self.nav_destination = dest
+
+        dist_txt = ""
+        with self.gps_lock:
+            snap = dict(self.gps_location) if self.gps_location else None
+        if snap:
+            try:
+                d_m = geodesic(
+                    (snap["latitude"], snap["longitude"]),
+                    (dest["latitude"], dest["longitude"]),
+                ).meters
+                dist_txt = f" En línea recta son unos {self._nav_distance_text(d_m)}."
+            except Exception:
+                pass
+
+        print(
+            f"🧭 Destino: {label} → {dest['latitude']:.6f}, {dest['longitude']:.6f}"
+        )
+        return (
+            f"Te guío hacia {label}.{dist_txt} "
+            "Caminá y preguntá cómo voy o cuánto falta."
+        )
+
+    def set_nav_destination_home(self):
+        h = self.home_location
+        return self.set_nav_destination_coords(
+            h["latitude"], h["longitude"], h.get("label", "casa")
+        )
+
+    def _voice_wants_go_home(self, text):
+        t = re.sub(r"\s+", " ", (text or "").strip().lower())
+        if not re.search(r"\bcasa\b", t):
+            return False
+        if re.search(
+            r"(?:llev|llév|gui|guí|ir|volver|regres|quiero|naveg|and[aá]|camina)",
+            t,
+        ):
+            return True
+        return t in ("casa", "mi casa", "a casa", "ir casa", "volver casa")
+
+    def set_nav_destination(self, address_text):
+        """Geocodifica y guarda destino. Devuelve texto para espeak."""
+        if not self.geolocator:
+            return "No puedo buscar direcciones sin conexión a internet."
+        addr = self._nav_clean_address(address_text)
+        if not addr or len(addr) < 4:
+            return "Decime la calle y el número, por ejemplo: San Martín 500."
+
+        # Por defecto Rafaela (proyecto local); override: export NAV_GEOCODE_SUFFIX="..."
+        default_suffix = ", Rafaela, Santa Fe, Argentina"
+        suffix = os.environ.get("NAV_GEOCODE_SUFFIX", default_suffix).strip()
+        query = f"{addr}{suffix}" if suffix else addr
+        try:
+            tmo = int(os.environ.get("NAV_GEOCODE_TIMEOUT", "6"))
+        except ValueError:
+            tmo = 6
+        tmo = max(3, min(12, tmo))
+
+        try:
+            loc = self.geolocator.geocode(query, timeout=tmo, language="es")
+        except Exception as e:
+            print(f"🧭 Geocodificar destino falló: {e}")
+            return "No pude buscar esa dirección. Revisá internet e intentá otra vez."
+
+        if not loc:
+            return (
+                f"No encontré {addr} en Rafaela. "
+                "Probá con calle y número, por ejemplo: San Martín 500."
+            )
+
+        label = (loc.address or addr).split(",")[0].strip()
+        if len(label) > 80:
+            label = label[:77] + "..."
+
+        dest = {
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "label": label,
+            "query": query,
+            "set_at": time.time(),
+        }
+        with self.nav_lock:
+            self.nav_destination = dest
+
+        dist_txt = ""
+        with self.gps_lock:
+            snap = dict(self.gps_location) if self.gps_location else None
+        if snap:
+            try:
+                d_m = geodesic(
+                    (snap["latitude"], snap["longitude"]),
+                    (dest["latitude"], dest["longitude"]),
+                ).meters
+                dist_txt = f" En línea recta son unos {self._nav_distance_text(d_m)}."
+            except Exception:
+                pass
+
+        print(f"🧭 Destino: {label} → {dest['latitude']:.6f}, {dest['longitude']:.6f}")
+        return (
+            f"Te guío hacia {label}.{dist_txt} "
+            "Caminá y preguntá cómo voy o cuánto falta."
+        )
+
+    def get_nav_guidance_text(self):
+        """Distancia y orientación al destino activo."""
+        with self.nav_lock:
+            dest = dict(self.nav_destination) if self.nav_destination else None
+        if not dest:
+            return (
+                "No hay destino guardado. "
+                "Decí por ejemplo: quiero ir a San Martín 500, guíame."
+            )
+
+        if not self.gps_serial:
+            self.try_connect_gps_lazy("guía de destino")
+        if not self.gps_serial:
+            return "No detecto el GPS. Conectalo y preguntá otra vez."
+
+        with self.gps_lock:
+            snap = dict(self.gps_location) if self.gps_location else None
+        if not snap:
+            return (
+                "GPS sin señal todavía. Esperá unos segundos al aire libre y preguntá otra vez."
+            )
+
+        try:
+            d_m = geodesic(
+                (snap["latitude"], snap["longitude"]),
+                (dest["latitude"], dest["longitude"]),
+            ).meters
+        except Exception:
+            return "No pude calcular la distancia al destino."
+
+        try:
+            arrival_m = float(os.environ.get("NAV_ARRIVAL_M", "35"))
+        except ValueError:
+            arrival_m = 35.0
+        arrival_m = max(15.0, min(80.0, arrival_m))
+
+        label = dest.get("label") or "el destino"
+        if d_m <= arrival_m:
+            self.clear_nav_destination()
+            return f"Llegaste cerca de {label}. Destino cumplido."
+
+        dist = self._nav_distance_text(d_m)
+        bearing = self._bearing_deg(
+            snap["latitude"], snap["longitude"], dest["latitude"], dest["longitude"]
+        )
+        course = snap.get("course_deg")
+        turn = self._nav_turn_hint(bearing, course)
+
+        if turn == "adelante":
+            return f"Vas bien hacia {label}. Te faltan unos {dist}, sigue adelante."
+        if turn in ("a tu izquierda", "a tu derecha"):
+            lado = "izquierda" if turn == "a tu izquierda" else "derecha"
+            return (
+                f"Hacia {label} te faltan unos {dist}. "
+                f"El destino está más a tu {lado}."
+            )
+
+        card = self._bearing_cardinal_es(bearing)
+        return (
+            f"Hacia {label} te faltan unos {dist} en línea recta. "
+            f"El destino queda hacia el {card}."
+        )
+
+    def _process_nav_voice_command(self, command, command_lower, after_listen_prompt=False):
+        """Comandos: ir a / guíame / cómo voy / cancelar ruta."""
+        t = re.sub(r"\s+", " ", (command_lower or "").strip())
+
+        cancel_patterns = [
+            r"\bcancelar (?:la )?(?:ruta|gu[ií]a|destino|navegaci[oó]n)\b",
+            r"\bparar (?:la )?(?:ruta|gu[ií]a|destino)\b",
+            r"\bborrar (?:el )?destino\b",
+            r"\bno quiero (?:ir|seguir)\b",
+            r"\bdejar de guiar\b",
+        ]
+        for pat in cancel_patterns:
+            if re.search(pat, t):
+                self.clear_nav_destination()
+                msg = "Listo, cancelé la guía al destino."
+                print(f"🧭 {msg}")
+                self.speak_text(msg, force=True)
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                return True
+
+        status_patterns = [
+            r"\bc[uú]anto falta\b",
+            r"\bc[oó]mo voy\b",
+            r"\bdistancia al destino\b",
+            r"\bd[oó]nde queda\b",
+            r"\bc[uú]anto me falta\b",
+            r"\bestoy cerca\b",
+            r"\bllegu[eé]\b",
+        ]
+        with self.nav_lock:
+            has_dest = self.nav_destination is not None
+        for pat in status_patterns:
+            if has_dest and re.search(pat, t):
+                msg = self.get_nav_guidance_text()
+                print(f"🧭 Guía ({command.strip()}): {msg}")
+                self.speak_text(msg, force=True)
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                return True
+
+        if self._voice_wants_go_home(t):
+            print("🧭 Destino: casa (coordenadas guardadas)")
+            msg = self.set_nav_destination_home()
+            print(f"🧭 {msg}")
+            self.speak_text(msg, force=True)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return True
+
+        dest_phrase = self._extract_nav_destination(t)
+        if dest_phrase and dest_phrase.strip().lower() in ("casa", "mi casa", "a casa"):
+            print("🧭 Destino: casa (coordenadas guardadas)")
+            msg = self.set_nav_destination_home()
+            print(f"🧭 {msg}")
+            self.speak_text(msg, force=True)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return True
+
+        if dest_phrase:
+            print(f"🧭 Destino pedido por voz: {dest_phrase}")
+            try:
+                self.speak_text_sync("Buscando el destino.")
+            except Exception:
+                pass
+            msg = self.set_nav_destination(dest_phrase)
+            print(f"🧭 {msg}")
+            self.speak_text(msg, force=True)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return True
+
+        if after_listen_prompt and has_dest:
+            if t in ("guíame", "guiame", "guia", "guía", "navega", "navegar"):
+                msg = self.get_nav_guidance_text()
+                print(f"🧭 Guía ({command.strip()}): {msg}")
+                self.speak_text(msg, force=True)
+                with self.user_speaking_lock:
+                    self.user_speaking = False
+                return True
+
+        return False
+
+    def _voice_summary_and_maybe_listen(self, summary_cycle_count, resumen):
+        """
+        Ciclos 1–3: solo dice lo que ve. Ciclo 4: solo pregunta y escucha.
+        Devuelve True si hay que salir del bucle principal.
+        """
+        if summary_cycle_count % 4 == 0:
+            print(f"\n🔊 Ciclo {summary_cycle_count}: ¿Deseas preguntar algo?")
+            self.speak_text_sync("¿Deseas preguntar algo?")
+            print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
+            with self.user_speaking_lock:
+                self.user_speaking = True
+            user_text = self.listen_once(timeout_seconds=8)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            self.last_listen_end_time = time.time()
+            if user_text:
+                print(f"\n🎤 Dijiste: {user_text}\n")
+                self.process_voice_command(user_text, after_listen_prompt=True)
+            return not self.running
+
+        print(f"\n🔊 RESUMEN (ciclo {summary_cycle_count}): {resumen}")
+        self.speak_text(resumen)
+        return False
     
     def _signal_handler(self, signum, frame):
         """Maneja señales para detener el programa correctamente"""
@@ -1212,6 +1757,13 @@ class OAKDObjectDetector:
                         )
                     if distance is None:
                         distance = self.get_distance_at_point(depth_frame, dcx, dcy)
+                elif class_name in ("chair", "couch", "dining table", "bench"):
+                    # Asiento: bbox completo (percentil bajo) evita medir el respaldo o el fondo
+                    distance = self.get_distance_in_bbox(
+                        depth_frame, dx1, dy1, dx2, dy2, percentile=30
+                    )
+                    if distance is None:
+                        distance = self.get_distance_at_point(depth_frame, dcx, dcy)
                 else:
                     distance = self.get_distance_at_point(depth_frame, dcx, dcy)
 
@@ -1492,10 +2044,7 @@ class OAKDObjectDetector:
         mensajes = []
         for nombre_es, distancias in objetos_agrupados.items():
             distancia_promedio = sum(distancias) / len(distancias)
-            if distancia_promedio < 1:
-                dist_texto = f"{int(distancia_promedio * 100)} centímetros"
-            else:
-                dist_texto = f"{distancia_promedio:.1f} metros"
+            dist_texto = self._format_distancia_voz(distancia_promedio) or "distancia desconocida"
             
             if len(distancias) > 1:
                 nm = nombre_es
@@ -2277,6 +2826,9 @@ class OAKDObjectDetector:
             with self.user_speaking_lock:
                 self.user_speaking = False
             return False
+
+        if self._process_nav_voice_command(command, command_lower, after_listen_prompt):
+            return True
         
         # Comandos GPS
         gps_patterns = [
@@ -2373,15 +2925,20 @@ class OAKDObjectDetector:
             'perrito': 'dog'
         }
         
-        # Patrones de preguntas
+        # Patrones de preguntas (siempre responden con distancia si lo detecta)
         pregunta_patterns = [
             r'estás viendo (?:una |un |el |la )?(\w+)',
-            r'ves (?:una |un |el |la )?(\w+)',
+            r'estas viendo (?:una |un |el |la )?(\w+)',
+            r'ves (?:una |un |el |la |alguna |algún |algun )?(\w+)',
             r'hay (?:una |un |el |la )?(\w+)',
             r'puedes ver (?:una |un |el |la )?(\w+)',
+            r'(?:dónde|donde) (?:está |esta |están |estan )?(?:la |el |una |un )?(\w+)',
+            r'(?:a cuánto|a cuanto) (?:está |esta )?(?:la |el |una |un )?(\w+)',
             r'(\w+) distancia',
-            r'a qué distancia (?:está |están )?(?:una |un |el |la )?(\w+)',
-            r'cuánto (?:está |están )?(?:una |un |el |la )?(\w+)',
+            r'a qué distancia (?:está |están |esta |estan )?(?:una |un |el |la )?(\w+)',
+            r'a que distancia (?:está |están |esta |estan )?(?:una |un |el |la )?(\w+)',
+            r'cuánto (?:está |están |esta |estan )?(?:una |un |el |la )?(\w+)',
+            r'cuanto (?:está |están |esta |estan )?(?:una |un |el |la )?(\w+)',
         ]
         
         objeto_encontrado = None
@@ -2403,94 +2960,22 @@ class OAKDObjectDetector:
                     objeto_encontrado = obj_en
                     break
         
-        # Buscar el objeto en los detectados actualmente
+        # Buscar el objeto en los detectados actualmente (siempre con distancia)
         if objeto_encontrado:
-            with self.objects_lock:
-                if objeto_encontrado in self.current_objects:
-                    obj_info = self.current_objects[objeto_encontrado]
-                    distancia = obj_info['distancia']
-                    
-                    # Traducir nombre al español para la respuesta
-                    traducciones = {
-                        'chair': 'silla',
-                        'person': 'persona',
-                        'car': 'auto',
-                        'bicycle': 'bicicleta',
-                        'dining table': 'mesa',
-                        'couch': 'sofá',
-                        'bed': 'cama',
-                        'tv': 'televisor',
-                        'laptop': 'computadora',
-                        'cell phone': 'teléfono',
-                        'bottle': 'botella',
-                        'cup': 'taza',
-                        'book': 'libro',
-                        'clock': 'reloj',
-                        'cat': 'gato',
-                        'dog': 'perro'
-                    }
-                    
-                    nombre_es = traducciones.get(objeto_encontrado, objeto_encontrado)
-                    
-                    if distancia < 1:
-                        respuesta = f"Sí, estoy viendo {nombre_es} a {int(distancia * 100)} centímetros"
-                    else:
-                        respuesta = f"Sí, estoy viendo {nombre_es} a {distancia:.1f} metros"
-                    
-                    print(f"📢 Respuesta: {respuesta}")
-                    self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
-                    # Desactivar bandera después de responder
-                    with self.user_speaking_lock:
-                        self.user_speaking = False
-                    return True
-                else:
-                    # Buscar variaciones del nombre
-                    for obj_name in self.current_objects.keys():
-                        if objeto_encontrado in obj_name.lower() or obj_name.lower() in objeto_encontrado:
-                            obj_info = self.current_objects[obj_name]
-                            distancia = obj_info['distancia']
-                            
-                            traducciones = {
-                                'chair': 'silla',
-                                'person': 'persona',
-                                'car': 'auto',
-                                'bicycle': 'bicicleta',
-                                'dining table': 'mesa',
-                                'couch': 'sofá',
-                                'bed': 'cama',
-                                'tv': 'televisor',
-                                'laptop': 'computadora',
-                                'cell phone': 'teléfono',
-                                'bottle': 'botella',
-                                'cup': 'taza',
-                                'book': 'libro',
-                                'clock': 'reloj',
-                                'cat': 'gato',
-                                'dog': 'perro'
-                            }
-                            
-                            nombre_es = traducciones.get(obj_name, obj_name)
-                            
-                            if distancia < 1:
-                                respuesta = f"Sí, estoy viendo {nombre_es} a {int(distancia * 100)} centímetros"
-                            else:
-                                respuesta = f"Sí, estoy viendo {nombre_es} a {distancia:.1f} metros"
-                            
-                            print(f"📢 Respuesta: {respuesta}")
-                            self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
-                            # Desactivar bandera después de responder
-                            with self.user_speaking_lock:
-                                self.user_speaking = False
-                            return True
-                    
-                    # No se encontró el objeto
-                    respuesta = f"No, no estoy viendo {objeto_encontrado} en este momento"
-                    print(f"📢 Respuesta: {respuesta}")
-                    self.speak_text(respuesta, force=True)  # Forzar para responder al usuario
-                    # Desactivar bandera después de responder
-                    with self.user_speaking_lock:
-                        self.user_speaking = False
-                    return True
+            hallado = self._buscar_objeto_actual(objeto_encontrado)
+            if hallado:
+                obj_name, obj_info = hallado
+                respuesta = self._respuesta_objeto_detectado(
+                    obj_name, obj_info.get("distancia")
+                )
+            else:
+                nombre_es = self._nombre_objeto_es(objeto_encontrado)
+                respuesta = f"No veo {nombre_es} en este momento."
+            print(f"📢 Respuesta: {respuesta}")
+            self.speak_text(respuesta, force=True)
+            with self.user_speaking_lock:
+                self.user_speaking = False
+            return True
         
         # Desactivar bandera si no se procesó ningún comando
         with self.user_speaking_lock:
@@ -2581,8 +3066,10 @@ class OAKDObjectDetector:
         print("🎤 Micrófono: Comandos por voz (si está conectado)")
         print("🌐 Si te alejás del WiFi, SSH puede cortarse: usá tmux/screen o datos en la Jetson (modem USB).")
         print("📍 GPS + modem: export GPS_SERIAL_PORT=/dev/ttyUSB1 — identificar con lsusb y ls /dev/ttyUSB*")
+        print("🧭 Guía: quiero ir a [calle y número] guíame — o llevame a casa (GPS guardado)")
+        print("   Luego: cómo voy / cuánto falta. Cancelar: cancelar ruta")
         print("⌨️  PARA SALIR: Ctrl+C en esta terminal, o di 'terminar'/'apagar' cuando pregunte '¿Deseas preguntar algo?'")
-        print("   Cada 4 ciclos de lo que ve, te preguntará si quieres preguntar algo y ahí podrás hablar.\n")
+        print("   3 veces dice lo que ve; al 4.º ciclo solo pregunta si deseas preguntar algo.\n")
         print("="*60 + "\n")
         
         frame_count = 0
@@ -2691,14 +3178,17 @@ class OAKDObjectDetector:
                             cv2.putText(frame, desnivel_info['mensaje'], (10, 90), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
-                # Actualizar objetos actuales para responder preguntas
+                # Actualizar objetos actuales (por clase: guardar el más cercano)
                 with self.objects_lock:
                     self.current_objects = {}
                     for obj in objetos:
-                        self.current_objects[obj['nombre']] = {
-                            'distancia': obj['distancia'],
-                            'confianza': obj['confianza']
-                        }
+                        nom = obj["nombre"]
+                        prev = self.current_objects.get(nom)
+                        if prev is None or obj["distancia"] < prev["distancia"]:
+                            self.current_objects[nom] = {
+                                "distancia": obj["distancia"],
+                                "confianza": obj["confianza"],
+                            }
                 
                 if frame_count % 10 == 0:
                     if objetos:
@@ -2712,71 +3202,39 @@ class OAKDObjectDetector:
                         if desnivel_info and desnivel_info['hay_desnivel']:
                             print(f"  ⚠️  Desnivel: {desnivel_info['mensaje']}")
                 
-                # Hablar resumen cada 10 segundos (lo que ve)
+                # Hablar resumen cada 10 s: 3 ciclos lo que ve, 4.º solo pregunta
                 if objetos:
                     if self.should_speak_summary():
                         summary_cycle_count += 1
                         resumen = self.generar_resumen_voz(objetos)
-                        print(f"\n🔊 RESUMEN: {resumen}")
-                        if summary_cycle_count % 4 == 0:
-                            # Ciclo 4: hablar y esperar a que termine, luego preguntar y escuchar (sin superponer)
-                            self.speak_text_sync(resumen)
-                            # Siempre preguntar en ciclo 4.
-                            # El lock de audio evita que el OCR y la pregunta se solapen.
-                            self.speak_text_sync("¿Deseas preguntar algo?")
-                            print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
-                            with self.user_speaking_lock:
-                                self.user_speaking = True
-                            user_text = self.listen_once(timeout_seconds=8)
-                            with self.user_speaking_lock:
-                                self.user_speaking = False
-                            self.last_listen_end_time = time.time()
-                            if user_text:
-                                print(f"\n🎤 Dijiste: {user_text}\n")
-                                self.process_voice_command(
-                                    user_text, after_listen_prompt=True
-                                )
-                                if not self.running:
-                                    break
-                        else:
-                            self.speak_text(resumen)
+                        if self._voice_summary_and_maybe_listen(
+                            summary_cycle_count, resumen
+                        ):
+                            break
                 else:
                     if self.should_speak_summary():
                         summary_cycle_count += 1
-                        # Si acabamos de leer un cartel (o el OCR aún está en progreso),
-                        # evita repetir "no veo nada" justo después.
                         ocr_in_prog = False
                         try:
                             with self.ocr_thread_lock:
-                                ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
-                        except:
-                            ocr_in_prog = bool(getattr(self, "ocr_in_progress", False))
-                        # Solo mientras el hilo OCR está activo (evita repetir "leyendo" 15 s sin proceso)
+                                ocr_in_prog = bool(
+                                    getattr(self, "ocr_in_progress", False)
+                                )
+                        except Exception:
+                            ocr_in_prog = bool(
+                                getattr(self, "ocr_in_progress", False)
+                            )
                         if ocr_in_prog:
                             resumen = "Estoy leyendo un cartel."
                         else:
-                            resumen = "No estoy viendo ningún objeto en este momento. No hay obstáculos próximos"
-                        print(f"\n🔊 RESUMEN: {resumen}")
-                        if summary_cycle_count % 4 == 0:
-                            self.speak_text_sync(resumen)
-                            # Siempre preguntar en ciclo 4.
-                            self.speak_text_sync("¿Deseas preguntar algo?")
-                            print("🎤 Escuchando... (puedes preguntar o decir 'terminar'/'apagar')", flush=True)
-                            with self.user_speaking_lock:
-                                self.user_speaking = True
-                            user_text = self.listen_once(timeout_seconds=8)
-                            with self.user_speaking_lock:
-                                self.user_speaking = False
-                            self.last_listen_end_time = time.time()
-                            if user_text:
-                                print(f"\n🎤 Dijiste: {user_text}\n")
-                                self.process_voice_command(
-                                    user_text, after_listen_prompt=True
-                                )
-                                if not self.running:
-                                    break
-                        else:
-                            self.speak_text(resumen)
+                            resumen = (
+                                "No estoy viendo ningún objeto en este momento. "
+                                "No hay obstáculos próximos"
+                            )
+                        if self._voice_summary_and_maybe_listen(
+                            summary_cycle_count, resumen
+                        ):
+                            break
                 
                 frame_count += 1
                 if frame_count % 30 == 0:

@@ -79,6 +79,16 @@ Puedes hacer preguntas por voz usando el micrófono del auricular. El programa r
 - "Coordenadas"
 - "GPS"
 
+**Guía a un destino** (cuando pregunte *¿Deseas preguntar algo?*):
+- "Quiero ir a San Martín 500, guíame"
+- "Llévame a casa" / "Quiero ir a casa, guíame" (usa `mi_casa_gps.json`, sin internet)
+- "¿Cómo voy?" / "¿Cuánto falta?" (con destino activo)
+- "Cancelar ruta"
+
+Requiere GPS con señal. Las calles se buscan en **Rafaela, Santa Fe** (internet). La **casa** está guardada en `mi_casa_gps.json` (coordenadas por defecto: -31.260652, -61.475046).
+
+**Ciclo de voz:** 3 veces dice lo que ve; al 4.º ciclo solo pregunta *¿Deseas preguntar algo?*
+
 **Para apagar el programa:**
 - "Apagar"
 - "Cerrar"
@@ -88,9 +98,9 @@ Puedes hacer preguntas por voz usando el micrófono del auricular. El programa r
 - "Terminar"
 
 El programa responderá con frases como:
-- "Sí, estoy viendo silla a 2.5 metros"
-- "Sí, estoy viendo persona a 1.2 metros"
-- "No, no estoy viendo [objeto] en este momento"
+- "Silla está a 2 metros." (siempre con distancia si la detecta)
+- "Persona está a 1 metro y medio."
+- "No veo silla en este momento."
 - "Estoy cerca de Avenida Principal 123, Barrio Centro, Ciudad." (solo dirección por voz cuando hay geocodificación)
 - "Ubicación por satélite: 34.052 grados Norte, 118.243 grados Oeste" (si no se puede obtener la dirección)
 - "No tengo señal GPS en este momento. Asegúrate de estar al aire libre"
